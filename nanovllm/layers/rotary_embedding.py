@@ -3,6 +3,7 @@ import torch
 from torch import nn
 
 
+
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -55,7 +56,6 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
 def get_rope(
     head_size: int,
     rotary_dim: int,
