@@ -38,14 +38,14 @@ def load_read_value_to_parameters(name: str, target_tensor: torch.Tensor, qweigh
     
 
 
-def load_model(model: nn.Module, path: str, local_rank: int, start_layer: int, end_layer: int):
+def load_model(model: nn.Module, path: str, tp_size: int, local_rank: int, start_layer: int, end_layer: int):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     already_loaded_set = set()
     for file in sorted(glob(os.path.join(path, "*.safetensors"))):
-        # print(f"Loading weights from {file}")
+        print(f"Loading weights from {file}")
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
-                print(f"origin weight_name = {weight_name}")
+                # print(f"origin weight_name = {weight_name}")
                 original_weight_name = weight_name
                 original_weight_name_parts = original_weight_name.split(".")
 
@@ -72,9 +72,10 @@ def load_model(model: nn.Module, path: str, local_rank: int, start_layer: int, e
                 weight_name = weight_name.replace("e_score_correction_bias", "bias")
 
                 weight_name_parts = weight_name.split(".")
+                tp_split_dim = None
                 for i in range(len(weight_name_parts)):
                     if weight_name_parts[i] in packed_modules_mapping:
-                        weight_name_parts[i] = packed_modules_mapping[weight_name_parts[i]][0]
+                        weight_name_parts[i], tp_split_dim = packed_modules_mapping[weight_name_parts[i]]
 
                 weight_name = ".".join(weight_name_parts)
 
@@ -106,34 +107,34 @@ def load_model(model: nn.Module, path: str, local_rank: int, start_layer: int, e
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.qweight"
                     loaded_tensor = f.get_tensor(original_weight_name)
                     fused_moe_param_weight.data[expert_idx, :intermediate_size_per_partition // 8, :].copy_(
-                        loaded_tensor[:, local_rank * intermediate_size_per_partition // 8: (local_rank + 1) * intermediate_size_per_partition // 8].t())
+                        loaded_tensor.narrow(1, local_rank * intermediate_size_per_partition // 8, intermediate_size_per_partition // 8).t())
 
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.scales"
                     loaded_tensor = f.get_tensor(original_weight_name)
                     fused_moe_param_scale.data[expert_idx, :intermediate_size_per_partition, :].copy_(
-                        loaded_tensor[:, local_rank * intermediate_size_per_partition: (local_rank + 1) * intermediate_size_per_partition].t())
+                        loaded_tensor.narrow(1, local_rank * intermediate_size_per_partition, intermediate_size_per_partition).t())
 
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.qzeros"
                     loaded_tensor = f.get_tensor(original_weight_name)
                     fused_moe_param_zero.data[expert_idx, :intermediate_size_per_partition // 8, :].copy_(
-                        loaded_tensor[:, local_rank * intermediate_size_per_partition // 8: (local_rank + 1) * intermediate_size_per_partition // 8].t())
+                        loaded_tensor.narrow(1, local_rank * intermediate_size_per_partition // 8, intermediate_size_per_partition // 8).t())
 
                     
                     # handle w3
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.qweight"
                     loaded_tensor = f.get_tensor(original_weight_name)
                     fused_moe_param_weight.data[expert_idx, intermediate_size_per_partition // 8:, :].copy_(
-                        loaded_tensor[:, local_rank * intermediate_size_per_partition // 8: (local_rank + 1) * intermediate_size_per_partition // 8].t())
+                        loaded_tensor.narrow(1, local_rank * intermediate_size_per_partition // 8, intermediate_size_per_partition // 8).t())
 
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.scales"
                     loaded_tensor = f.get_tensor(original_weight_name)
                     fused_moe_param_scale.data[expert_idx, intermediate_size_per_partition:, :].copy_(
-                        loaded_tensor[:, local_rank * intermediate_size_per_partition: (local_rank + 1) * intermediate_size_per_partition].t())
+                        loaded_tensor.narrow(1, local_rank * intermediate_size_per_partition, intermediate_size_per_partition).t())
 
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.qzeros"
                     loaded_tensor = f.get_tensor(original_weight_name)
                     fused_moe_param_zero.data[expert_idx, intermediate_size_per_partition // 8:, :].copy_(
-                        loaded_tensor[:, local_rank * intermediate_size_per_partition // 8: (local_rank + 1) * intermediate_size_per_partition // 8].t())
+                        loaded_tensor.narrow(1, local_rank * intermediate_size_per_partition // 8, intermediate_size_per_partition // 8).t())
 
                     # load w2
                     fused_moe_param_weight = get_param_from_model(model, f"layers.{layer_idx}.ffn.experts.w2_qweight")
@@ -142,15 +143,22 @@ def load_model(model: nn.Module, path: str, local_rank: int, start_layer: int, e
 
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.qweight"
                     loaded_tensor = f.get_tensor(original_weight_name)
-                    fused_moe_param_weight.data[expert_idx, :, :].copy_(loaded_tensor.t())
+                    fused_moe_param_weight.data[expert_idx, :, :].copy_(
+                        loaded_tensor.narrow(0, local_rank * intermediate_size_per_partition, intermediate_size_per_partition).t())
 
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.scales"
                     loaded_tensor = f.get_tensor(original_weight_name)
-                    fused_moe_param_scale.data[expert_idx, :, :].copy_(loaded_tensor.t())
+                    assert loaded_tensor.size(tp_split_dim) % tp_size == 0, f"Dimension {tp_split_dim} must be divisible by {tp_size}"
+                    shard_size = loaded_tensor.size(tp_split_dim) // tp_size
+                    fused_moe_param_scale.data[expert_idx, :, :].copy_(
+                        loaded_tensor.narrow(0, local_rank*shard_size, shard_size).t())
 
                     original_weight_name = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.qzeros"
                     loaded_tensor = f.get_tensor(original_weight_name)
-                    fused_moe_param_zero.data[expert_idx, :, :].copy_(loaded_tensor.t())
+                    assert loaded_tensor.size(tp_split_dim) % tp_size == 0, f"Dimension {tp_split_dim} must be divisible by {tp_size}"
+                    shard_size = loaded_tensor.size(tp_split_dim) // tp_size
+                    fused_moe_param_zero.data[expert_idx, :, :].copy_(
+                        loaded_tensor.narrow(0, local_rank*shard_size, shard_size).t())
 
 
                     already_loaded_set.add(load_dedup_key)
@@ -184,7 +192,15 @@ def load_model(model: nn.Module, path: str, local_rank: int, start_layer: int, e
                     if dequant_param is None:
                         print(f"Warning: Parameter {param_path} not found in model.")
                         continue
-                    dequant_param.data.copy_(dequant_tensor.T)
+                    
+                    if tp_split_dim is not None:
+                        assert dequant_tensor.size(tp_split_dim) % tp_size == 0, f"Dimension {tp_split_dim} must be divisible by {tp_size}"
+                        shard_size = dequant_tensor.size(tp_split_dim) // tp_size
+                        
+                        weight_shard = dequant_tensor.narrow(tp_split_dim, local_rank * shard_size, shard_size)
+                        dequant_param.data.copy_(weight_shard.T)
+                    else:
+                        dequant_param.data.copy_(dequant_tensor.T)
 
                     already_loaded_set.add(load_dedup_key)
                 else:
@@ -200,7 +216,21 @@ def load_model(model: nn.Module, path: str, local_rank: int, start_layer: int, e
                                 
 
                             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                            weight_loader(param, f.get_tensor(original_weight_name), None)
+                                
+
+                            if split_dim is None:
+                                weight_loader(param, f.get_tensor(original_weight_name), None)
+                            else:
+                                whole_weight = f.get_tensor(original_weight_name)
+                                assert whole_weight.size(tp_split_dim) % tp_size == 0, f"Dimension {tp_split_dim} must be divisible by {tp_size}"
+                                shard_size = whole_weight.size(tp_split_dim) // tp_size
+                                
+                                weight_shard = whole_weight.narrow(tp_split_dim, local_rank * shard_size, shard_size)
+                                try:
+                                    weight_loader(param, weight_shard, None)
+                                except:
+                                    if local_rank == 0:
+                                        import pdb; pdb.set_trace()
                             break
 
 

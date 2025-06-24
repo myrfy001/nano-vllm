@@ -38,8 +38,8 @@ class ModelRunner:
 
         
         start_layer = 0
-        end_layer = 3
-        load_model(self.model, config.model, local_rank=rank, start_layer=start_layer, end_layer=end_layer)
+        end_layer = 4
+        load_model(self.model, config.model, tp_size=config.tensor_parallel_size, local_rank=rank, start_layer=start_layer, end_layer=end_layer)
 
         self.sampler = Sampler()
         self.allocate_kv_cache(config.gpu_memory_utilization)
@@ -50,7 +50,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                try:
+                    self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                except FileExistsError:
+                    self.shm = SharedMemory(name="nanovllm", size=2**20)
+
                 dist.barrier()
             else:
                 dist.barrier()

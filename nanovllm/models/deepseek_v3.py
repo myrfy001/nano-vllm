@@ -691,23 +691,23 @@ class DeepseekV3ForCausalLLM(nn.Module):
     """
 
     packed_modules_mapping = {
-        "embed_tokens": ("embed", 0),
+        "embed_tokens": ("embed", 1),
         "input_layernorm": ("attn_norm", None),
         "post_attention_layernorm": ("ffn_norm", None),
-        "q_proj": ("wq", 0),
+        "q_proj": ("wq", 1),
         "q_a_proj": ("wq_a", None),
         "q_a_layernorm": ("q_norm", None),
-        "q_b_proj": ("wq_b", 0),
+        "q_b_proj": ("wq_b", 1),
         "kv_a_proj_with_mqa": ("wkv_a", None),
         "kv_a_layernorm": ("kv_norm", None),
-        "kv_b_proj": ("wkv_b", 0),
-        "o_proj": ("wo", 1),
+        "kv_b_proj": ("wkv_b", 1),
+        "o_proj": ("wo", 0),
         "gate": ("gate", None),
-        "gate_proj": ("w1", 0),
-        "down_proj": ("w2", 1),
-        "up_proj": ("w3", 0),
+        "gate_proj": ("w1", 1),
+        "down_proj": ("w2", 0),
+        "up_proj": ("w3", 1),
         "norm": ("norm", None),
-        "lm_head": ("head", 0),
+        "lm_head": ("head", 0),  # note: lm_head is not like quanted params, it's not transposed in file, so use 0 dim to split here 
         "scale": ("scale", None),
     }
 
@@ -762,7 +762,7 @@ class DeepseekV3ForCausalLLM(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
-        seqlen = tokens.size(1)
+        seqlen = tokens.size(0)
         h = self.embed(tokens)
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = None
@@ -784,5 +784,5 @@ class DeepseekV3ForCausalLLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        logits = self.lm_head(hidden_states)
+        logits = self.head(hidden_states)
         return logits
