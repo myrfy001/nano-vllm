@@ -41,9 +41,8 @@ class ModelRunner:
 
         # import pdb; pdb.set_trace()
 
-        start_layer = 0
-        end_layer = 1
-        load_model(self.model, config.model, tp_size=config.tensor_parallel_size, local_rank=rank, start_layer=start_layer, end_layer=end_layer)
+        pp_start_layer_id, pp_end_layer_id, pp_node_type = config.pp_schema
+        load_model(self.model, config.model, tp_size=config.tensor_parallel_size, local_rank=rank, start_layer=pp_start_layer_id, end_layer=pp_end_layer_id)
 
         self.sampler = Sampler()
         self.allocate_kv_cache(config.gpu_memory_utilization)

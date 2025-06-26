@@ -1,12 +1,13 @@
 import os
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
+from argparse import ArgumentParser
 
 
-def main():
+def main(node_id: int):
     path = os.path.expanduser("/data/mmh/DeepSeek-V3-0324-AWQ")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=4)
+    llm = LLM(path, enforce_eager=True, tensor_parallel_size=4, node_id=node_id)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
@@ -30,4 +31,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+    parser.add_argument("--node-id", type=int, required=True)
+    cli_args = parser.parse_args()
+    main(cli_args.node_id)

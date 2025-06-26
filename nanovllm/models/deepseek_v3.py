@@ -747,9 +747,12 @@ class DeepseekV3ForCausalLLM(nn.Module):
         self.max_seq_len = args.max_position_embeddings
         self.embed = ParallelEmbedding(args.vocab_size, args.hidden_size)
         self.layers = torch.nn.ModuleList()
-        args.num_hidden_layers = 1
-        for layer_id in range(args.num_hidden_layers):
+
+        pp_start_layer_id, pp_end_layer_id, pp_node_type = nanovllm_config.pp_schema
+        for layer_id in range(pp_start_layer_id, pp_end_layer_id):
             self.layers.append(Z100_Block(layer_id, args, nanovllm_config))
+        self.pp_node_type = pp_node_type
+
         self.norm = RMSNorm(args.hidden_size)
         self.head = ColumnParallelLinear(args.hidden_size, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
