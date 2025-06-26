@@ -28,6 +28,9 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
+        
+        assert hf_config.torch_dtype == torch.float16 # TODO: FIXME: hardcoded for z100
+
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         
@@ -36,9 +39,10 @@ class ModelRunner:
         else:
             self.model = Qwen3ForCausalLM(hf_config)
 
-        
+        # import pdb; pdb.set_trace()
+
         start_layer = 0
-        end_layer = 4
+        end_layer = 1
         load_model(self.model, config.model, tp_size=config.tensor_parallel_size, local_rank=rank, start_layer=start_layer, end_layer=end_layer)
 
         self.sampler = Sampler()
@@ -109,15 +113,28 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+        # TODO: harded coded for deepseek v3 and MLA
+        num_kv_heads = 1
+        # num_kv_heads = hf_config.num_key_value_heads // self.world_size
+
+        kv_cache_head_dim = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim 
+        block_bytes = 1 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * kv_cache_head_dim * hf_config.torch_dtype.itemsize
+        # block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+        
         config.num_kvcache_blocks = int(total * gpu_memory_utilization - used) // block_bytes
-        self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
+        
+        # TODO：harded coded for deepseek v3 and MLA
+        self.kv_cache = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, kv_cache_head_dim)
+        # self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
+        
         layer_id = 0
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+            # if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+            #     module.k_cache = self.kv_cache[0, layer_id]
+            #     module.v_cache = self.kv_cache[1, layer_id]
+            #     layer_id += 1
+            if hasattr(module, "kv_c_and_k_pe_cache"):
+                module.k_cache = self.kv_cache[layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -137,11 +154,13 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        context_lens = [] # for prefill that does not support cumulative input 
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+            context_lens.append(seqlen)
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -163,7 +182,8 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):

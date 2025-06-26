@@ -9,7 +9,8 @@ import torch.distributed as dist
 
 from nanovllm.layers.fused_moe import FusedMoE
 from nanovllm.layers.kernel import act_quant, weight_dequant, fp8_gemm
-
+from nanovllm.utils.context import get_context
+from nanovllm.layers.attention import store_kvcache
 
 world_size = 1
 rank = 0
@@ -130,7 +131,9 @@ class ParallelEmbedding(nn.Module):
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    assert weight.is_contiguous()
     return F.linear(x, weight, bias)
+
 
 
 
@@ -565,7 +568,7 @@ class Z100_MLA(nn.Module):
         # Convert from (N, B, L) to (B, N, L)
         return ql_nope.transpose(0, 1), q_pe # [1, 128, 512] [1, 128, 64]
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
 
@@ -600,11 +603,11 @@ class Z100_MLA(nn.Module):
         # print(f'MLA: {q_nope=}, {q_pe=}')
         # update kvcache
         # print(f'MLA: {kv_c_normed=}, {k_pe=}')
-        kv_c_and_k_pe = torch.cat([kv_c_normed, k_pe.squeeze(1)], dim=-1)  # [1, 1, 512 + 64]
+        kv_c_and_k_pe = torch.cat([kv_c_normed, k_pe.squeeze(2)], dim=-1)  # [1, 1, 512 + 64]
         assert self.page_size == 1
-        Skv = start_pos + seqlen
-        page_start, page_end = start_pos // self.page_size, triton.cdiv(Skv, self.page_size)
-        self.kv_c_and_k_pe_cache[page_start:page_end] = kv_c_and_k_pe
+
+        context = get_context()
+        store_kvcache(kv_c_and_k_pe, self.kv_c_and_k_pe_cache, context.slot_mapping)
 
         # Attention
         q = torch.cat([q_nope, q_pe], dim=-1)
@@ -612,9 +615,6 @@ class Z100_MLA(nn.Module):
 
         kv_c_and_k_pe_cache = self.kv_c_and_k_pe_cache
         kv_c_cache = kv_c_and_k_pe_cache[..., :self.kv_lora_rank]
-        # Testing arguments
-        req_to_tokens = torch.arange(0, Skv, device=q.device, dtype=torch.int32).broadcast_to([bsz, Skv])
-        b_seq_len = torch.full([bsz], Skv, device=q.device, dtype=torch.int32)
 
         config = {
             'SPLIT_K': 2,
@@ -625,8 +625,8 @@ class Z100_MLA(nn.Module):
             kv_c_and_k_pe_cache,
             kv_c_cache,
             o,
-            req_to_tokens,
-            b_seq_len,
+            context.block_tables,
+            context.context_lens,
             config=config,
         )
 
@@ -658,8 +658,9 @@ class Z100_Block(nn.Module):
         self.ffn = MLP(args.hidden_size, args.intermediate_size) if layer_id < args.first_k_dense_replace else Z100_MoE(args, nanovllm_config)
         self.attn_norm = RMSNorm(args.hidden_size)
         self.ffn_norm = RMSNorm(args.hidden_size)
+        self.fake_op = MLP(args.hidden_size, args.intermediate_size)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for the Transformer block.
 
@@ -672,8 +673,11 @@ class Z100_Block(nn.Module):
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
-        x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        x = x + self.ffn(self.ffn_norm(x))
+            
+        # x = x + self.attn(self.attn_norm(x), positions, freqs_cis, mask)
+        # x = x + self.ffn(self.ffn_norm(x))
+
+        x = self.fake_op(x)
         return x
 
 
@@ -691,7 +695,7 @@ class DeepseekV3ForCausalLLM(nn.Module):
     """
 
     packed_modules_mapping = {
-        "embed_tokens": ("embed", 1),
+        "embed_tokens": ("embed", 0),
         "input_layernorm": ("attn_norm", None),
         "post_attention_layernorm": ("ffn_norm", None),
         "q_proj": ("wq", 1),
@@ -743,7 +747,7 @@ class DeepseekV3ForCausalLLM(nn.Module):
         self.max_seq_len = args.max_position_embeddings
         self.embed = ParallelEmbedding(args.vocab_size, args.hidden_size)
         self.layers = torch.nn.ModuleList()
-        args.num_hidden_layers = 4
+        args.num_hidden_layers = 1
         for layer_id in range(args.num_hidden_layers):
             self.layers.append(Z100_Block(layer_id, args, nanovllm_config))
         self.norm = RMSNorm(args.hidden_size)
@@ -751,7 +755,7 @@ class DeepseekV3ForCausalLLM(nn.Module):
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+    def forward(self, tokens: torch.Tensor, positions: torch.Tensor):
         """
         Forward pass for the Transformer model.
 
@@ -764,12 +768,17 @@ class DeepseekV3ForCausalLLM(nn.Module):
         """
         seqlen = tokens.size(0)
         h = self.embed(tokens)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        freqs_cis = self.freqs_cis[positions]
         mask = None
-        if seqlen > 1:
+
+        h = h.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, barch size is 1, so we can add a dim to walk around.
+
+        context = get_context()
+        if context.is_prefill:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, positions, freqs_cis, mask)
         h = self.norm(h)[:, -1]
         logits = self.head(h)
 
@@ -784,5 +793,4 @@ class DeepseekV3ForCausalLLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        logits = self.head(hidden_states)
-        return logits
+        return hidden_states

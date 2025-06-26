@@ -97,17 +97,39 @@ class BlockManager:
     def may_append(self, seq: Sequence):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-        else:
-            assert last_block.hash == -1
+
+
+
+        # when block_size is greater than 1, in every decoding step, only one new token is generated, so it can use `len(seq) % self.block_size == 1` to detect if we need a new block.
+        # but when block_size is 1, every decoding step need a new block.
+
+        # first, alloc a new block
+        assert last_block.hash != -1
+        block_id = self.free_block_ids[0]
+        self._allocate_block(block_id)
+        block_table.append(block_id)
+
+        # second, put data into new block
+        last_block = self.blocks[block_table[-1]]
+        assert last_block.hash == -1
+        token_ids = seq.block(seq.num_blocks-1)
+        prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+        h = self.compute_hash(token_ids, prefix)
+        last_block.update(h, token_ids)
+        self.hash_to_block_id[h] = last_block.block_id
+
+
+        # if len(seq) % self.block_size == 1:
+        #     assert last_block.hash != -1
+        #     block_id = self.free_block_ids[0]
+        #     self._allocate_block(block_id)
+        #     block_table.append(block_id)
+        # elif len(seq) % self.block_size == 0:
+        #     assert last_block.hash == -1
+        #     token_ids = seq.block(seq.num_blocks-1)
+        #     prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+        #     h = self.compute_hash(token_ids, prefix)
+        #     last_block.update(h, token_ids)
+        #     self.hash_to_block_id[h] = last_block.block_id
+        # else:
+        #     assert last_block.hash == -1

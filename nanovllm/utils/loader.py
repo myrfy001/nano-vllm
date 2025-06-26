@@ -45,6 +45,9 @@ def load_model(model: nn.Module, path: str, tp_size: int, local_rank: int, start
         print(f"Loading weights from {file}")
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                # if ("embed_tokens" in weight_name):
+                #     import pdb; pdb.set_trace()
+            
                 # print(f"origin weight_name = {weight_name}")
                 original_weight_name = weight_name
                 original_weight_name_parts = original_weight_name.split(".")
@@ -58,7 +61,7 @@ def load_model(model: nn.Module, path: str, tp_size: int, local_rank: int, start
                     if ("model.lm_head" in original_weight_name or  "model.norm" in original_weight_name) and  end_layer != 60:
                         # some weights only belong to the last pp rank
                         continue
-                    elif ("embed_tokens" in original_weight_name) and start_layer != 1:
+                    elif ("embed_tokens" in original_weight_name) and start_layer != 0:
                         # some weights only belong to the first pp rank
                         continue
 
@@ -219,16 +222,23 @@ def load_model(model: nn.Module, path: str, tp_size: int, local_rank: int, start
                                 
 
                             if split_dim is None:
-                                weight_loader(param, f.get_tensor(original_weight_name), None)
+                                whole_weight = f.get_tensor(original_weight_name)
+                                if whole_weight.dtype == torch.bfloat16:
+                                    whole_weight = whole_weight.to(torch.float16)
+
+                                weight_loader(param, whole_weight, None)
                             else:
                                 whole_weight = f.get_tensor(original_weight_name)
+                                if whole_weight.dtype == torch.bfloat16:
+                                    whole_weight = whole_weight.to(torch.float16)
+                                
                                 assert whole_weight.size(tp_split_dim) % tp_size == 0, f"Dimension {tp_split_dim} must be divisible by {tp_size}"
                                 shard_size = whole_weight.size(tp_split_dim) // tp_size
                                 
                                 weight_shard = whole_weight.narrow(tp_split_dim, local_rank * shard_size, shard_size)
                                 try:
                                     weight_loader(param, weight_shard, None)
-                                except:
+                                except Exception as e:
                                     if local_rank == 0:
                                         import pdb; pdb.set_trace()
                             break
@@ -238,7 +248,12 @@ def load_model(model: nn.Module, path: str, tp_size: int, local_rank: int, start
                         param = get_param_from_model(model, weight_name)
                         if param is not None:
                             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                            weight_loader(param, f.get_tensor(original_weight_name), None)
+                            
+                            whole_weight = f.get_tensor(original_weight_name)
+                            if whole_weight.dtype == torch.bfloat16:
+                                whole_weight = whole_weight.to(torch.float16)
+                            
+                            weight_loader(param, whole_weight, None)
                         else:
                             raise Exception(f"Warning: Parameter {weight_name} not found in model.")
                             
