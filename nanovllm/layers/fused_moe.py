@@ -2,8 +2,10 @@ import triton
 import triton.language as tl
 import torch
 
+print("before import vllm")
 from vllm import _custom_ops as ops
 from vllm.model_executor.utils import set_weight_attrs
+print("after import vllm")
 from typing import Any, Dict, List, Optional, Tuple
 from torch.profiler import ProfilerActivity
 

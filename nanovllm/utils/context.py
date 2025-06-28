@@ -25,3 +25,22 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
 def reset_context():
     global _CONTEXT
     _CONTEXT = Context()
+
+_TP = None
+_TP_RANK = None
+_TP_WORLD_SIZE = None
+
+def set_tp_context_info(tp_group, tp_rank, tp_world_size):
+    global _TP, _TP_RANK, _TP_WORLD_SIZE
+    _TP = tp_group
+    _TP_RANK = tp_rank
+    _TP_WORLD_SIZE = tp_world_size
+
+def get_tp_group():
+    return _TP
+
+def get_tp_rank():
+    return _TP_RANK
+
+def get_tp_world_size():
+    return _TP_WORLD_SIZE

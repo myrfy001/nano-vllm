@@ -1,9 +1,12 @@
 import atexit
 from dataclasses import fields
 from time import perf_counter
+import time
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+import torch
+from torch.profiler import ProfilerActivity
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -27,6 +30,7 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
+            print(f"start process {i}")
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
@@ -47,7 +51,10 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        print(f"{time.time()}, LLMEngine in step(), before model_runner.call, seqs={seqs}, is_prefill={is_prefill}")
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        print(f"{time.time()}, LLMEngine in step(), after model_runner.call")
+
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
@@ -70,22 +77,39 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
-        while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+
+        prof_early_break_counter = 0
+        with torch.profiler.profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=0, warmup=1, active=10),
+            record_shapes=True,
+            with_stack=True,
+            profile_memory=True,
+        ) as prof:
+            while not self.is_finished():
+                t = perf_counter()
+                output, num_tokens = self.step()
                 if use_tqdm:
-                    pbar.update(1)
+                    if num_tokens > 0:
+                        prefill_throughput = num_tokens / (perf_counter() - t)
+                    else:
+                        decode_throughput = -num_tokens / (perf_counter() - t)
+                    pbar.set_postfix({
+                        "Prefill": f"{int(prefill_throughput)}tok/s",
+                        "Decode": f"{int(decode_throughput)}tok/s",
+                    })
+                for seq_id, token_ids in output:
+                    outputs[seq_id] = token_ids
+                    if use_tqdm:
+                        pbar.update(1)
+                
+                prof.step()
+                prof_early_break_counter += 1
+                if prof_early_break_counter >= 300:
+                    break
+        prof.export_chrome_trace(f"tracing.json.gz")
+
+
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:

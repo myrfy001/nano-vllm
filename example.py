@@ -4,10 +4,10 @@ from transformers import AutoTokenizer
 from argparse import ArgumentParser
 
 
-def main(node_id: int):
+def main(node_id: int, node_num: int):
     path = os.path.expanduser("/data/mmh/DeepSeek-V3-0324-AWQ")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=4, node_id=node_id)
+    llm = LLM(path, enforce_eager=False, tensor_parallel_size=4, node_id=node_id, node_num=node_num)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
@@ -33,5 +33,6 @@ def main(node_id: int):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--node-id", type=int, required=True)
+    parser.add_argument("--node-num", type=int, required=True)
     cli_args = parser.parse_args()
-    main(cli_args.node_id)
+    main(cli_args.node_id, cli_args.node_num)

@@ -3,6 +3,9 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from nanovllm.utils.context import get_context, get_tp_rank, get_tp_world_size, get_tp_group
+
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -21,8 +24,8 @@ class LinearBase(nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = get_tp_rank()
+        self.tp_size = get_tp_world_size()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -119,7 +122,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.head_size = head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_world_size()
         self.num_heads = divide(self.total_num_heads, tp_size)
         self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
         input_size = hidden_size
@@ -175,5 +178,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=get_tp_group())
         return y

@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+import time
 from typing import Tuple, Optional, Literal
 
 import torch
@@ -11,6 +12,8 @@ from nanovllm.layers.fused_moe import FusedMoE
 from nanovllm.layers.kernel import act_quant, weight_dequant, fp8_gemm
 from nanovllm.utils.context import get_context
 from nanovllm.layers.attention import store_kvcache
+from nanovllm.config import PPNodeType
+from nanovllm.utils.context import get_context, get_tp_rank, get_tp_world_size, get_tp_group
 
 world_size = 1
 rank = 0
@@ -126,7 +129,7 @@ class ParallelEmbedding(nn.Module):
 
 
         y[mask] = 0
-        dist.all_reduce(y)
+        dist.all_reduce(y, group=get_tp_group())
         return y
 
 
@@ -235,7 +238,7 @@ class RowParallelLinear(Linear):
         """
         y = linear(x, self.weight)
 
-        dist.all_reduce(y)
+        dist.all_reduce(y, group=get_tp_group())
 
         if self.bias is not None:
             y += self.bias
@@ -470,7 +473,7 @@ class Z100_MoE(nn.Module):
         y = self.experts(hidden_states=x, router_logits=weights)
 
         z = self.shared_experts(x)
-        dist.all_reduce(y)
+        dist.all_reduce(y, group=get_tp_group())
         return (y + z).view(shape)
 
 
@@ -731,30 +734,26 @@ class DeepseekV3ForCausalLLM(nn.Module):
         args.rope_theta = 10000
         args.max_batch_size = 1
 
+        pp_start_layer_id, pp_end_layer_id, pp_node_type = nanovllm_config.pp_schema
 
-
-        
         global world_size, rank
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = nanovllm_config.tensor_parallel_size
+        rank = nanovllm_config.local_rank
 
         # assert dist.get_world_size == torch.cuda.device_count(), f"World size ({dist.get_world_size()}) must match the number of GPUs ({torch.cuda.device_count()})" 
-        nanovllm_config.local_rank = rank
 
         Linear.dtype = torch.float16
         super().__init__()
         self.nanovllm_config = nanovllm_config
         self.max_seq_len = args.max_position_embeddings
-        self.embed = ParallelEmbedding(args.vocab_size, args.hidden_size)
+
         self.layers = torch.nn.ModuleList()
 
-        pp_start_layer_id, pp_end_layer_id, pp_node_type = nanovllm_config.pp_schema
         for layer_id in range(pp_start_layer_id, pp_end_layer_id):
             self.layers.append(Z100_Block(layer_id, args, nanovllm_config))
         self.pp_node_type = pp_node_type
 
-        self.norm = RMSNorm(args.hidden_size)
-        self.head = ColumnParallelLinear(args.hidden_size, args.vocab_size, dtype=torch.get_default_dtype())
+        
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
     @torch.inference_mode()
@@ -769,26 +768,7 @@ class DeepseekV3ForCausalLLM(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
-        seqlen = tokens.size(0)
-        h = self.embed(tokens)
-        freqs_cis = self.freqs_cis[positions]
-        mask = None
-
-        h = h.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, barch size is 1, so we can add a dim to walk around.
-
-        context = get_context()
-        if context.is_prefill:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
-
-        for layer in self.layers:
-            h = layer(h, positions, freqs_cis, mask)
-        h = self.norm(h)[:, -1]
-        logits = self.head(h)
-
-        all_logits = [torch.empty_like(logits) for _ in range(world_size)]
-        dist.all_gather(all_logits, logits)
-        logits = torch.cat(all_logits, dim=-1)
-        return logits
+        raise NotImplementedError
 
 
 
@@ -797,3 +777,75 @@ class DeepseekV3ForCausalLLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return hidden_states
+    
+
+class DeepseekV3ForCausalLLMFirst(DeepseekV3ForCausalLLM):
+    def __init__(self, args, nanovllm_config):
+        super().__init__(args, nanovllm_config)
+        self.embed = ParallelEmbedding(args.vocab_size, args.hidden_size)
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, positions: torch.Tensor):
+
+        context = get_context()
+
+        seqlen = tokens.size(0)
+        mask = None
+        if context.is_prefill:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+        freqs_cis = self.freqs_cis[positions]
+
+        h = self.embed(tokens)
+        h = h.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, barch size is 1, so we can add a dim to walk around.
+
+        for layer in self.layers:
+            h = layer(h, positions, freqs_cis, mask)
+        return h
+
+class DeepseekV3ForCausalLLMMiddle(DeepseekV3ForCausalLLM):
+    def __init__(self, args, nanovllm_config):
+        super().__init__(args, nanovllm_config)
+
+    @torch.inference_mode()
+    def forward(self, h: torch.Tensor, positions: torch.Tensor):
+        context = get_context()
+        seqlen = h.size(0)
+        mask = None
+        if context.is_prefill:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=h.device).triu_(1)
+
+        # print(f"{time.time()}, rank={get_tp_rank()}, positions={positions}, self.freqs_cis={self.freqs_cis}, {positions.device}, {self.freqs_cis.device}")
+
+        freqs_cis = self.freqs_cis[positions]
+        for layer in self.layers:
+            h = layer(h, positions, freqs_cis, mask)
+        return h
+        
+
+class DeepseekV3ForCausalLLMLast(DeepseekV3ForCausalLLM):
+    def __init__(self, args, nanovllm_config):
+        super().__init__(args, nanovllm_config)
+        self.norm = RMSNorm(args.hidden_size)
+        self.head = ColumnParallelLinear(args.hidden_size, args.vocab_size, dtype=torch.get_default_dtype())
+
+    @torch.inference_mode()
+    def forward(self, h: torch.Tensor, positions: torch.Tensor):
+        context = get_context()
+        seqlen = h.size(0)
+        mask = None
+        if context.is_prefill:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=h.device).triu_(1)
+
+        freqs_cis = self.freqs_cis[positions]
+        for layer in self.layers:
+            h = layer(h, positions, freqs_cis, mask)
+
+        # print(f"{time.time()}, rank={get_tp_rank()}, DeepseekV3ForCausalLLMLast's forward before norm, h={h}")
+
+        h = self.norm(h)
+        logits = self.head(h)
+
+        all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+        dist.all_gather(all_logits, logits, group=get_tp_group())
+        logits = torch.cat(all_logits, dim=-1)
+        return logits

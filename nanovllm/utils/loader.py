@@ -76,7 +76,7 @@ def load_model(model: nn.Module, path: str, tp_size: int, local_rank: int, start
                     if not (start_layer <= layer_idx < end_layer):
                         continue
                 else:
-                    if ("model.lm_head" in original_weight_name or  "model.norm" in original_weight_name) and  end_layer != 60:
+                    if ("lm_head" in original_weight_name or  "model.norm" in original_weight_name) and  end_layer != 60:
                         # some weights only belong to the last pp rank
                         continue
                     elif ("embed_tokens" in original_weight_name) and start_layer != 0:
@@ -229,7 +229,12 @@ def load_model(model: nn.Module, path: str, tp_size: int, local_rank: int, start
                             v, split_dim = packed_modules_mapping[k]
                             param_name = weight_name.replace(k, v)
                             # print(f"param_name = {param_name}, k= {k}, v = {v}, split_dim = {split_dim}")
-                            param = get_param_from_model(model, param_name, start_layer)
+                            try:
+                                param = get_param_from_model(model, param_name, start_layer)
+                            except:
+                                import traceback; traceback.print_exc()
+                                import pdb; pdb.set_trace()
+
                             if param is None:
                                 raise Exception(f"Warning: Parameter {param_name} not found in model.")
                                 
