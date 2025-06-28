@@ -81,7 +81,7 @@ class LLMEngine:
         prof_early_break_counter = 0
         with torch.profiler.profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=0, warmup=1, active=10),
+            schedule=torch.profiler.schedule(wait=0, warmup=10, active=300),
             record_shapes=True,
             with_stack=True,
             profile_memory=True,
@@ -105,8 +105,9 @@ class LLMEngine:
                 
                 prof.step()
                 prof_early_break_counter += 1
-                if prof_early_break_counter >= 300:
-                    break
+                print(f"current step = {prof_early_break_counter}")
+                # if prof_early_break_counter >= 30:
+                #     break
         prof.export_chrome_trace(f"tracing.json.gz")
 
 
