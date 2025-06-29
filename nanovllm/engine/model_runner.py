@@ -86,6 +86,11 @@ class ModelRunner:
         self.pp_node_type = pp_node_type
 
 
+        print(f"{time.time()}, rank{self.tp_rank}, in ModelRunner __init__ before global barrier")
+        dist.barrier()
+        print(f"{time.time()}, rank{self.tp_rank}, in ModelRunner __init__ after global barrier")
+
+
         self.sampler = Sampler()
         self.allocate_kv_cache(config.gpu_memory_utilization)
         if not self.enforce_eager:
@@ -101,13 +106,13 @@ class ModelRunner:
                 except FileExistsError:
                     self.shm = SharedMemory(name="nanovllm", size=2**20)
 
-                dist.barrier()
+                dist.barrier(group=self.tp_group)
                 
                 # only the first node's first process doesn't run the loop.
                 if(pp_node_type != PPNodeType.PPNodeFirst):
                     self.loop()
             else:
-                dist.barrier()
+                dist.barrier(group=self.tp_group)
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
@@ -115,7 +120,7 @@ class ModelRunner:
     def exit(self):
         if self.tp_world_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist.barrier(group=self.tp_group)
             if self.tp_rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
@@ -123,48 +128,55 @@ class ModelRunner:
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
+
     def loop(self):
+        if True:
+            prof_early_break_counter = 0
+            with torch.profiler.profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=0, warmup=10, active=300),
+                record_shapes=True,
+                with_stack=True,
+                profile_memory=True,
+            ) as prof:
+                while True:
+                    continue_loop = self.loop_inner()
+                    if not continue_loop:
+                        break
+
+                    prof_early_break_counter += 1
+                    if prof_early_break_counter > 150:
+                        break
+                    prof.step()
+                    
+            prof.export_chrome_trace(f"tracing-node-{self.config.node_id}-rank-{self.tp_rank}.json.gz")
+        else:
+            while True:
+                continue_loop = self.loop_inner()
+                if not continue_loop:
+                    break
+
+
+    def loop_inner(self):
         if self.tp_rank == 0:
             # for tp_rank 0 in nonn-first layer, it should receive request from previous node and dispatch them to local tp ranks.
             assert self.pp_node_type != PPNodeType.PPNodeFirst
             
-            # prof_early_break_counter = 0
-            # with torch.profiler.profile(
-            #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            #     schedule=torch.profiler.schedule(wait=0, warmup=10, active=300),
-            #     record_shapes=True,
-            #     with_stack=True,
-            #     profile_memory=True,
-            # ) as prof:
+            
+            context, hidden_state, positions = self.recv_pp_cmd()
 
-            #     while True:
-            #         context, hidden_state, positions = self.recv_pp_cmd()
+            # print(f"{time.time()}, rank{self.tp_rank}, in loop(), get new pp cmd, context={context}, hidden_state={hidden_state}, positions={positions}")
 
-            #         # print(f"{time.time()}, rank{self.tp_rank}, in loop(), get new pp cmd, context={context}, hidden_state={hidden_state}, positions={positions}")
-
-            #         args = (hidden_state, positions, context)
-            #         self.call("run_non_first_node", *args)
-
-            #         prof_early_break_counter += 1
-            #         if prof_early_break_counter > 250:
-            #             break
-            #         prof.step()
-            # prof.export_chrome_trace(f"tracing-node-{self.config.node_id}-rank-{self.tp_rank}.json.gz")
-
-            while True:
-                context, hidden_state, positions = self.recv_pp_cmd()
-
-                # print(f"{time.time()}, rank{self.tp_rank}, in loop(), get new pp cmd, context={context}, hidden_state={hidden_state}, positions={positions}")
-
-                args = (hidden_state, positions, context)
-                self.call("run_non_first_node", *args)
+            args = (hidden_state, positions, context)
+            self.call("run_non_first_node", *args)
+            return True
 
         else:
-            while True:
-                method_name, args = self.read_shm()
-                self.call(method_name, *args)
-                if method_name == "exit":
-                    break
+            method_name, args = self.read_shm()
+            self.call(method_name, *args)
+            if method_name == "exit":
+                return False
+            return True
 
     def send_pp_cmd(self, context, hidden_state, positions):
         assert self.tp_rank == 0
@@ -179,7 +191,6 @@ class ModelRunner:
                         context.block_tables.size()[0],
                         context.block_tables.size()[1],
                         hidden_state.size()[0],
-                        hidden_state.size()[1],
                         positions.size()[0]
                     ], dtype=torch.int32, device=self.device)
             
@@ -210,7 +221,7 @@ class ModelRunner:
     def recv_pp_cmd(self, logit_tensor=None):
         assert self.tp_rank == 0
         if self.pp_node_type != PPNodeType.PPNodeFirst:
-            meta_tensor = torch.zeros([8, ], dtype=torch.int32, device=self.device)
+            meta_tensor = torch.zeros([7, ], dtype=torch.int32, device=self.device)
 
             # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={meta_tensor.size()}, dtype={meta_tensor.dtype} meta_tensor")
             dist.recv(meta_tensor, self.prev_pp_head_node_global_rank)
@@ -222,8 +233,8 @@ class ModelRunner:
             slot_mapping = torch.empty([int(meta_tensor[1]),], dtype=torch.int32, device=self.device)
             context_lens = torch.empty([int(meta_tensor[2]),], dtype=torch.int32, device=self.device)
             block_tables = torch.empty([int(meta_tensor[3]), int(meta_tensor[4])], dtype=torch.int32, device=self.device)
-            hidden_state = torch.empty([int(meta_tensor[5]), int(meta_tensor[6]), self.config.hf_config.hidden_size], dtype=torch.float16, device=self.device)
-            positions = torch.empty([int(meta_tensor[7]),], dtype=torch.int64, device=self.device)
+            hidden_state = torch.empty([int(meta_tensor[5]), self.config.hf_config.hidden_size], dtype=torch.float16, device=self.device)
+            positions = torch.empty([int(meta_tensor[6]),], dtype=torch.int64, device=self.device)
 
             # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={slot_mapping.size()}, dtype={slot_mapping.dtype} slot_mapping")
             dist.recv(slot_mapping, self.prev_pp_head_node_global_rank)
@@ -399,14 +410,15 @@ class ModelRunner:
     def run_model(self, input_tensor: torch.Tensor, positions: torch.Tensor, is_prefill):
         # print(f"{time.time()}, rank{self.tp_rank}, in run_model() begin, is_prefill={is_prefill}, self.enforce_eager={self.enforce_eager}, nput_tensor.size={input_tensor.size()}")
         if is_prefill or self.enforce_eager or input_tensor.size(0) > 512:
-            
             # print(f"{time.time()}, rank{self.tp_rank}, in run_model() before model run, input_tensor={input_tensor}, {input_tensor.size()}, positions={positions}, {positions.size()}")
             hidden_state = self.model(input_tensor, positions)
             # print(f"{time.time()}, rank{self.tp_rank}, in run_model() after model run, hidden_state={hidden_state}, {hidden_state.size()}")
 
             if self.pp_node_type == PPNodeType.PPNodeLast:
-                return self.model.compute_logits(hidden_state)
+                logits = self.model.compute_logits(hidden_state)
+                return logits
             else:
+                hidden_state = hidden_state.squeeze(0)
                 return hidden_state
         else:
             # print(f"{time.time()}, rank{self.tp_rank}, in run_model(), cuda-graph run path enter")
@@ -432,8 +444,11 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+
+            # print(f'{time.time()}, rank{self.tp_rank}, in run_model() before model replay')
             graph.replay()
-            # print(f'{time.time()}, rank{self.tp_rank}, in run_model() after model replay, hidden_state={graph_vars["outputs"]}')
+            torch.cuda.synchronize()
+            # print(f'{time.time()}, rank{self.tp_rank}, in run_model() after model replay')
 
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -453,27 +468,17 @@ class ModelRunner:
         if self.tp_rank == 0:
             context = get_context()
             # print(f"{time.time()}, rank{self.tp_rank}, in run(), before send_pp_cmd(), context={context}")
-
-            if hidden_state.dim() == 2:
-                # TODO: FIXME: when not using graph, the hidden shape is [bs, seqlen, hidden dim],
-                # but when using graph, it requires bs=1, and the return is [bs, hidden dim], and infact bs==1
-                # in order to make it same with prefill, unsqueeze it
-                assert not is_prefill
-                assert len(seqs) == 1
-                hidden_state = hidden_state.unsqueeze(0)
             
             self.send_pp_cmd(context, hidden_state, positions)
             # print(f"{time.time()}, rank{self.tp_rank}, in run(), after send_pp_cmd()")
 
             temperatures = self.prepare_sample(seqs) if self.tp_rank == 0 else None
-            logits = torch.empty([1, input_ids.size()[0], self.config.hf_config.vocab_size], dtype=torch.float16).cuda()
+            logits = torch.empty([input_ids.size()[0], self.config.hf_config.vocab_size], dtype=torch.float16).cuda()
 
             # print(f"{time.time()}, rank{self.tp_rank}, in run(), before recv_pp_cmd()")
             self.recv_pp_cmd(logits)
 
-            # TODO: FIXME: since model doesn't support cumulate, the first dim is batch size(which is hard coded to 1), so before return it to engine, we need to remove it.
-            assert logits.dim() == 3 and logits.size()[0] == 1
-            logits = logits.squeeze(0)
+            assert logits.dim() == 2
 
 
             # print(f"{time.time()}, rank{self.tp_rank}, in run(), after recv_pp_cmd(), logits={logits}, {logits.size()}, temperatures={temperatures}")

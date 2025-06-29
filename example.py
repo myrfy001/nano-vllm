@@ -1,4 +1,5 @@
 import os
+import time
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 from argparse import ArgumentParser
@@ -8,6 +9,10 @@ def main(node_id: int, node_num: int):
     path = os.path.expanduser("/data/mmh/DeepSeek-V3-0324-AWQ")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=False, tensor_parallel_size=4, node_id=node_id, node_num=node_num)
+
+    if node_id != 0:
+        time.sleep(100000)
+        raise SystemExit
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [

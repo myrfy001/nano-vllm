@@ -10,11 +10,16 @@ class PPNodeType:
 
 
 
+# _node_id_to_layers_mapping = {
+#     0: (0,3, PPNodeType.PPNodeFirst),
+#     1: (57,61, PPNodeType.PPNodeLast),
+# }
+
 _node_id_to_layers_mapping = {
     0: (0,3, PPNodeType.PPNodeFirst),
-    1: (59,61, PPNodeType.PPNodeLast),
+    1: (3,7, PPNodeType.PPNodeMiddle),
+    2: (57,61, PPNodeType.PPNodeLast),
 }
-
 
 # _node_id_to_layers_mapping = {
 #     0: (0,3, PPNodeType.PPNodeFirst),

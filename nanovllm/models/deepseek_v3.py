@@ -237,7 +237,7 @@ class RowParallelLinear(Linear):
             torch.Tensor: Transformed tensor with row-parallel computation.
         """
         y = linear(x, self.weight)
-
+        # print(f"{time.time()}, rank{get_tp_rank()}, in RowParallelLinear forward(), tp={world_size}")
         dist.all_reduce(y, group=get_tp_group())
 
         if self.bias is not None:
@@ -789,17 +789,20 @@ class DeepseekV3ForCausalLLMFirst(DeepseekV3ForCausalLLM):
 
         context = get_context()
 
-        seqlen = tokens.size(0)
+        tokens = tokens.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can add a dim to walk around.
+
+        seqlen = tokens.size(1)
         mask = None
         if context.is_prefill:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
         freqs_cis = self.freqs_cis[positions]
 
         h = self.embed(tokens)
-        h = h.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, barch size is 1, so we can add a dim to walk around.
 
         for layer in self.layers:
             h = layer(h, positions, freqs_cis, mask)
+
+        h = h.squeeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can remove a dim to walk around.
         return h
 
 class DeepseekV3ForCausalLLMMiddle(DeepseekV3ForCausalLLM):
@@ -808,6 +811,12 @@ class DeepseekV3ForCausalLLMMiddle(DeepseekV3ForCausalLLM):
 
     @torch.inference_mode()
     def forward(self, h: torch.Tensor, positions: torch.Tensor):
+        h = h.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can add a dim to walk around.
+
+        # print(f"{time.time()}, rank={get_tp_rank()}, DeepseekV3ForCausalLLMMiddle forward() positions={positions}, h={h}, {h.size()}")
+        assert h.dim() == 3  # [bs, seq_len, hidden]
+        assert h.size()[0] == 1 # TODO: FIXME: only support bs=1
+
         context = get_context()
         seqlen = h.size(0)
         mask = None
@@ -819,6 +828,8 @@ class DeepseekV3ForCausalLLMMiddle(DeepseekV3ForCausalLLM):
         freqs_cis = self.freqs_cis[positions]
         for layer in self.layers:
             h = layer(h, positions, freqs_cis, mask)
+        
+        h = h.squeeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can remove a dim to walk around.
         return h
         
 
@@ -830,6 +841,8 @@ class DeepseekV3ForCausalLLMLast(DeepseekV3ForCausalLLM):
 
     @torch.inference_mode()
     def forward(self, h: torch.Tensor, positions: torch.Tensor):
+        h = h.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can add a dim to walk around.
+
         context = get_context()
         seqlen = h.size(0)
         mask = None
@@ -848,4 +861,6 @@ class DeepseekV3ForCausalLLMLast(DeepseekV3ForCausalLLM):
         all_logits = [torch.empty_like(logits) for _ in range(world_size)]
         dist.all_gather(all_logits, logits, group=get_tp_group())
         logits = torch.cat(all_logits, dim=-1)
+
+        logits = logits.squeeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can remove a dim to walk around.
         return logits
