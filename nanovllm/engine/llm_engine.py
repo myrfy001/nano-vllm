@@ -76,16 +76,12 @@ class LLMEngine:
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
-        prefill_throughput = decode_throughput = 0.
+        
 
-        prof_early_break_counter = 0
-        with torch.profiler.profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=0, warmup=10, active=300),
-            record_shapes=True,
-            with_stack=True,
-            profile_memory=True,
-        ) as prof:
+
+        def core_inner(prof):
+            prefill_throughput = decode_throughput = 0.
+            prof_early_break_counter = 0
             while not self.is_finished():
                 t = perf_counter()
                 output, num_tokens = self.step()
@@ -103,12 +99,28 @@ class LLMEngine:
                     if use_tqdm:
                         pbar.update(1)
                 
-                prof.step()
+                
+                if prof is not None:
+                    prof.step()
                 prof_early_break_counter += 1
                 print(f"current step = {prof_early_break_counter}")
                 # if prof_early_break_counter >= 30:
                 #     break
-        prof.export_chrome_trace(f"tracing.json.gz")
+
+
+        if False:
+            with torch.profiler.profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=0, warmup=10, active=300),
+                record_shapes=True,
+                with_stack=True,
+                profile_memory=True,
+            ) as prof:
+                core_inner(prof)
+                
+            prof.export_chrome_trace(f"tracing.json.gz")
+        else:
+            core_inner(None)
 
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]

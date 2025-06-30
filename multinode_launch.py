@@ -1,8 +1,8 @@
 from fabric import Connection, Config, ThreadingGroup
 from threading import Thread
 
+shutdown_hosts = [(f"10.18.17.{i+141}", f"h02r3n{i:02d}") for i in range(3, 3+15)]
 hosts = [(f"10.18.17.{i+141}", f"h02r3n{i:02d}") for i in range(3, 3+15)]
-hosts = [(f"10.18.17.{i+141}", f"h02r3n{i:02d}") for i in range(3, 3+7)]
 password = "XaNjj@##Apir!"
 
 
@@ -20,6 +20,18 @@ def stop_all(node_id, ip_addr, user_name):
               docker ps | grep ds_pp
               """)
     c.close()
+
+
+def make_sure_docker_stopped(ip_addr, user_name):
+    config = Config(overrides={'sudo': {'password': password}})
+    c = Connection(ip_addr, user=user_name, connect_kwargs={"password": password}, config=config)
+    r = c.run(f"""
+              docker ps -a
+              """)
+    print(f"make_sure_docker_stopped {ip_addr} = {r.stdout}")
+    assert "ds_pp" not in r.stdout
+    c.close()
+
 
 def run_model(node_id, ip_addr, user_name):
     config = Config(overrides={'sudo': {'password': password}})
@@ -76,7 +88,7 @@ def run_model(node_id, ip_addr, user_name):
 
 
 threads = []
-for node_id, (ip_addr, user_name) in enumerate(hosts):
+for node_id, (ip_addr, user_name) in enumerate(shutdown_hosts):
     node_id = node_id + 1
     threads.append(Thread(target=stop_all, args=(node_id, ip_addr, user_name)))
 for thread in threads:
@@ -84,6 +96,10 @@ for thread in threads:
 for thread in threads:
     thread.join()
 
+
+for node_id, (ip_addr, user_name) in enumerate(shutdown_hosts):
+    make_sure_docker_stopped(ip_addr, user_name)
+    
 
 threads = []
 for node_id, (ip_addr, user_name) in enumerate(hosts):

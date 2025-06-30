@@ -86,10 +86,11 @@ class ModelRunner:
         self.pp_node_type = pp_node_type
 
 
-        print(f"{time.time()}, rank{self.tp_rank}, in ModelRunner __init__ before global barrier")
+        print(f"{time.time()}, rank{self.tp_rank}, in ModelRunner __init__ before global barrier", flush=True)
         dist.barrier()
-        print(f"{time.time()}, rank{self.tp_rank}, in ModelRunner __init__ after global barrier")
+        print(f"{time.time()}, rank{self.tp_rank}, in ModelRunner __init__ after global barrier", flush=True)
 
+        # import pdb; pdb.set_trace()
 
         self.sampler = Sampler()
         self.allocate_kv_cache(config.gpu_memory_utilization)
@@ -130,7 +131,7 @@ class ModelRunner:
 
 
     def loop(self):
-        if True:
+        if False:
             prof_early_break_counter = 0
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
