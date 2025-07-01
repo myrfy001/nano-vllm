@@ -131,7 +131,7 @@ class ModelRunner:
 
 
     def loop(self):
-        if False:
+        if True:
             prof_early_break_counter = 0
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],

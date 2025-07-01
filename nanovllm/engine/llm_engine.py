@@ -108,7 +108,7 @@ class LLMEngine:
                 #     break
 
 
-        if False:
+        if True:
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 schedule=torch.profiler.schedule(wait=0, warmup=10, active=300),
