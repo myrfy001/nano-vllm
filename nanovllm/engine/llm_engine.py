@@ -22,16 +22,16 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fileds}
         config = Config(model, **config_kwargs)
         self.ps = []
-        self.events = []
+        self.mp_queues = []
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            mp_queue = ctx.Queue()
+            process = ctx.Process(target=ModelRunner, args=(config, i, mp_queue))
             process.start()
             self.ps.append(process)
-            self.events.append(event)
+            self.mp_queues.append(mp_queue)
             print(f"start process {i}")
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0, self.mp_queues)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)

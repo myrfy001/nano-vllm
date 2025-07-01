@@ -3,7 +3,7 @@ import time
 import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerActivity
-from multiprocessing.synchronize import Event
+from multiprocessing import Queue
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config, PPNodeType
@@ -14,11 +14,11 @@ from nanovllm.models.deepseek_v3 import DeepseekV3ForCausalLLMFirst, DeepseekV3F
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context, Context, set_tp_context_info
 from nanovllm.utils.loader import load_model
-
+from nanovllm.utils.serdes import invoke_deserialize_context_kernel, invoke_serialize_context_kernel
 
 class ModelRunner:
 
-    def __init__(self, config: Config, tp_rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, tp_rank: int, mp_queue):
         
         config.local_rank = tp_rank
 
@@ -30,9 +30,17 @@ class ModelRunner:
         self.world_size = config.node_num * config.tensor_parallel_size
         self.rank = config.node_id * config.tensor_parallel_size + tp_rank
         self.tp_rank = tp_rank
-        self.event = event
+        self.mp_queue = mp_queue
         self.device = torch.device("cuda", self.tp_rank)
-    
+
+        self.buf_tensor = torch.empty((128,7168*2), dtype=torch.uint8, device=self.device)
+        self.meta_buf = torch.empty(8, dtype=torch.uint16, device=self.device)
+        self.slot_mapping_buf = torch.empty([2048,], dtype=torch.int32, device=self.device)
+        self.context_lens_buf = torch.empty([2048,], dtype=torch.int32, device=self.device)
+        self.block_tables_buf = torch.empty([1, 2048,], dtype=torch.int32, device=self.device)
+        self.hidden_state_buf = torch.empty([128, self.config.hf_config.hidden_size], dtype=torch.float16, device=self.device)
+        self.positions_buf = torch.empty([1024,], dtype=torch.int64, device=self.device)
+
         print("waiting dist init")
         dist.init_process_group("nccl", "tcp://10.18.17.159:2333", world_size=self.world_size, rank=self.rank)
         print("dist init done")
@@ -103,9 +111,9 @@ class ModelRunner:
         if self.tp_world_size > 1:
             if tp_rank == 0:
                 try:
-                    self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                    self.shm = SharedMemory(name="nanovllm-1", create=True, size=10*2**20)
                 except FileExistsError:
-                    self.shm = SharedMemory(name="nanovllm", size=2**20)
+                    self.shm = SharedMemory(name="nanovllm-1", size=10*2**20)
 
                 dist.barrier(group=self.tp_group)
                 
@@ -114,7 +122,7 @@ class ModelRunner:
                     self.loop()
             else:
                 dist.barrier(group=self.tp_group)
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name="nanovllm-1")
                 self.loop()
 
 
@@ -131,7 +139,7 @@ class ModelRunner:
 
 
     def loop(self):
-        if True:
+        if False:
             prof_early_break_counter = 0
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -164,11 +172,11 @@ class ModelRunner:
             assert self.pp_node_type != PPNodeType.PPNodeFirst
             
             
-            context, hidden_state, positions = self.recv_pp_cmd()
+            self.recv_pp_cmd()
 
-            # print(f"{time.time()}, rank{self.tp_rank}, in loop(), get new pp cmd, context={context}, hidden_state={hidden_state}, positions={positions}")
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in loop(), get new pp cmd", flush=True)
 
-            args = (hidden_state, positions, context)
+            args = (self.buf_tensor,)
             self.call("run_non_first_node", *args)
             return True
 
@@ -181,109 +189,60 @@ class ModelRunner:
 
     def send_pp_cmd(self, context, hidden_state, positions):
         assert self.tp_rank == 0
+
         if self.pp_node_type != PPNodeType.PPNodeLast:
+            with torch.profiler.record_function("do serialize"):
+                
+                
+                invoke_serialize_context_kernel(
+                    context.is_prefill, context.slot_mapping, context.context_lens, context.block_tables, hidden_state, positions, self.buf_tensor
+                )
 
-            # print(f"{time.time()}, rank{self.tp_rank}, in send_pp_cmd(), slot_mapping={context.slot_mapping.size()}, context_lens={context.context_lens.size()}, block_tables={context.block_tables.size()}, hidden_state={hidden_state.size()}, positions={positions.size()}")
-            with torch.profiler.record_function("create meta tensor"):
-                meta_tensor = torch.tensor([
-                        int(context.is_prefill),
-                        context.slot_mapping.size()[0],
-                        context.context_lens.size()[0],
-                        context.block_tables.size()[0],
-                        context.block_tables.size()[1],
-                        hidden_state.size()[0],
-                        positions.size()[0]
-                    ], dtype=torch.int32, device=self.device)
-            
-            # import pdb;pdb.set_trace()
-            # print(f"{time.time()}, rank{self.tp_rank}, in send_pp_cmd(), meta_tensor={meta_tensor}")
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.send size={meta_tensor.size()}, dtype={meta_tensor.dtype} meta_tensor")
-            dist.send(meta_tensor, self.next_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.send size={context.slot_mapping.size()}, dtype={context.slot_mapping.dtype} slot_mapping")
-            dist.send(context.slot_mapping, self.next_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.send size={context.context_lens.size()}, dtype={context.context_lens.dtype} context_lens")
-            dist.send(context.context_lens, self.next_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.send size={context.block_tables.size()}, dtype={context.block_tables.dtype} block_tables")
-            dist.send(context.block_tables, self.next_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} hidden_state")
-            dist.send(hidden_state, self.next_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.send size={positions.size()}, dtype={positions.dtype} positions")
-            dist.send(positions, self.next_pp_head_node_global_rank)
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
+            torch.cuda.synchronize()
+            dist.send(self.buf_tensor, self.next_pp_head_node_global_rank)
+            torch.cuda.synchronize()
         else:
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} hidden_state")
+            # for last node, send logits instead of hidden state
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} logits", flush=True)
+            torch.cuda.synchronize()
             dist.send(hidden_state, self.next_pp_head_node_global_rank)
+            torch.cuda.synchronize()
 
     def recv_pp_cmd(self, logit_tensor=None):
         assert self.tp_rank == 0
+
         if self.pp_node_type != PPNodeType.PPNodeFirst:
-            meta_tensor = torch.zeros([7, ], dtype=torch.int32, device=self.device)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={meta_tensor.size()}, dtype={meta_tensor.dtype} meta_tensor")
-            dist.recv(meta_tensor, self.prev_pp_head_node_global_rank)
-
-
-            # print(f"{time.time()}, rank{self.tp_rank}, in recv_pp_cmd(), meta_tensor={meta_tensor}")
-
-            is_prefill = bool(int(meta_tensor[0]))
-            slot_mapping = torch.empty([int(meta_tensor[1]),], dtype=torch.int32, device=self.device)
-            context_lens = torch.empty([int(meta_tensor[2]),], dtype=torch.int32, device=self.device)
-            block_tables = torch.empty([int(meta_tensor[3]), int(meta_tensor[4])], dtype=torch.int32, device=self.device)
-            hidden_state = torch.empty([int(meta_tensor[5]), self.config.hf_config.hidden_size], dtype=torch.float16, device=self.device)
-            positions = torch.empty([int(meta_tensor[6]),], dtype=torch.int64, device=self.device)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={slot_mapping.size()}, dtype={slot_mapping.dtype} slot_mapping")
-            dist.recv(slot_mapping, self.prev_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={context_lens.size()}, dtype={context_lens.dtype} context_lens")
-            dist.recv(context_lens, self.prev_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={block_tables.size()}, dtype={block_tables.dtype} block_tables")
-            dist.recv(block_tables, self.prev_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={hidden_state.size()}, dtype={hidden_state.dtype} hidden_state")
-            dist.recv(hidden_state, self.prev_pp_head_node_global_rank)
-
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={positions.size()}, dtype={positions.dtype} positions")
-            dist.recv(positions, self.prev_pp_head_node_global_rank)
-
-            # # TODO: FIXME: it seems a bug here, the dist.recv() can't work with tensor on CPU, so we must put it on GPU.
-            # # but when index something like freqs_cis, it should on CPU (or, it should on different GPU, but when dispatch it by shared memory, all rank will get gpu0)
-            # positions = positions.cpu()
-
-            # TODO: FIXME: hard code to None and 0 since not support batch and cumulate now
-            context = Context(is_prefill, None, None, 0, 0, slot_mapping, context_lens, block_tables)
-            return context, hidden_state, positions
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
+            dist.recv(self.buf_tensor, self.prev_pp_head_node_global_rank)
+            torch.cuda.synchronize()
         else:
             assert logit_tensor is not None
-            # print(f"{time.time()}, rank{self.tp_rank}, dist.recv size={logit_tensor.size()}, dtype={logit_tensor.dtype} logit_tensor")
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={logit_tensor.size()}, dtype={logit_tensor.dtype} logit_tensor", flush=True)
             dist.recv(logit_tensor, self.prev_pp_head_node_global_rank)
+            torch.cuda.synchronize()
             
             
 
 
     def read_shm(self):
         assert self.tp_world_size > 1 and self.tp_rank
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
+        method_name, args = self.mp_queue.get()
+        # n = int.from_bytes(self.shm.buf[0:4], "little")
+        # method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        # self.event.clear()
         return method_name, args
 
     def write_shm(self, method_name, *args):
         assert self.tp_world_size > 1 and not self.tp_rank
-        data = pickle.dumps([method_name, *args])
-        n = len(data)
-        assert n + 4 <= self.shm.size
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
+        # data = pickle.dumps([method_name, *args])
+        # n = len(data)
+        # print(f"n={n}, {self.shm.size}", flush=True)
+        # assert n + 4 <= self.shm.size
+        # self.shm.buf[0:4] = n.to_bytes(4, "little")
+        # self.shm.buf[4:n+4] = data
+        for mp_queue in self.mp_queue:
+            mp_queue.put((method_name, args))
 
     def call(self, method_name, *args):
         if self.tp_world_size > 1 and self.tp_rank == 0:
@@ -423,13 +382,14 @@ class ModelRunner:
                 return hidden_state
         else:
             # print(f"{time.time()}, rank{self.tp_rank}, in run_model(), cuda-graph run path enter")
-            bs = input_tensor.size(0)
-            context = get_context()
+            bs = 1 # TODO: FIXME 
+            # bs = input_tensor.size(0)
+            # context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
-            for k, v in graph_vars.items():
-                if k != "outputs":
-                    v.zero_()
+            # for k, v in graph_vars.items():
+            #     if k != "outputs":
+            #         v.zero_()
 
             # print(
             #     f"{time.time()}, rank{self.tp_rank}, in run_model(), cuda-graph run path enter",
@@ -440,11 +400,11 @@ class ModelRunner:
             #     f'block_tables: {graph_vars["block_tables"].size()}, {context.block_tables.size()}, '
             # )
 
-            graph_vars["input_tensor"][:bs] = input_tensor
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # graph_vars["input_tensor"][:bs] = input_tensor
+            # graph_vars["positions"][:bs] = positions
+            # graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            # graph_vars["context_lens"][:bs] = context.context_lens
+            # graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
 
             # print(f'{time.time()}, rank{self.tp_rank}, in run_model() before model replay')
             graph.replay()
@@ -491,30 +451,57 @@ class ModelRunner:
         return token_ids
     
 
-    def run_non_first_node(self, hidden_state: torch.Tensor, positions: torch.Tensor, context: Context) -> list[int]:
+    def run_non_first_node(self, buf_tensor: torch.Tensor) -> list[int]:
         assert self.pp_node_type != PPNodeType.PPNodeFirst
         
         # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), enter hidden_state={hidden_state}, positions={positions}")
+        local_buf_tensor = buf_tensor.to(self.device, non_blocking=True)
 
-        context.slot_mapping = context.slot_mapping.cuda(self.device)
-        context.context_lens = context.context_lens.cuda(self.device)
-        context.block_tables = context.block_tables.cuda(self.device)
+
+
+        invoke_deserialize_context_kernel(
+            local_buf_tensor,
+            self.meta_buf,
+            self.graph_vars["slot_mapping"],
+            self.graph_vars["context_lens"],
+            self.graph_vars["block_tables"],
+            self.graph_vars["input_tensor"][:1],
+            self.graph_vars["positions"][:1]
+        )
+        
+        torch.cuda.synchronize()
+        local_meta_buf_slice = self.meta_buf[0:6].tolist()
+        
+        # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), local_meta_buf_slice={local_meta_buf_slice}", flush=True)
+        is_prefill = bool(int(local_meta_buf_slice[0]))
+        slot_mapping_size = local_meta_buf_slice[1]
+        context_lens_size = local_meta_buf_slice[2]
+        block_tables_size = local_meta_buf_slice[3]
+        hidden_state_size = local_meta_buf_slice[4]
+        positions_size    = local_meta_buf_slice[5]
+
+        slot_mapping = self.graph_vars["slot_mapping"][:slot_mapping_size]
+        context_lens = self.graph_vars["context_lens"][:context_lens_size]
+        block_tables = self.graph_vars["block_tables"][:block_tables_size]
+        hidden_state = self.graph_vars["input_tensor"][:hidden_state_size]
+        positions = self.graph_vars["positions"][:positions_size]
+
+
+        # TODO: FIXME: hard code to None and 0 since not support batch and cumulate now
         set_context(
-            context.is_prefill,
-            context.cu_seqlens_q,
-            context.cu_seqlens_k,
-            context.max_seqlen_q,
-            context.max_seqlen_k,
-            context.slot_mapping,
-            context.context_lens,
-            context.block_tables
+            is_prefill,
+            None,
+            None,
+            0,
+            0,
+            slot_mapping,
+            context_lens,
+            block_tables
         )
 
-        hidden_state = hidden_state.cuda(self.device)
-        positions = positions.cuda(self.device)
 
         # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), before run_model()")
-        hidden_state = self.run_model(hidden_state, positions, context.is_prefill)
+        hidden_state = self.run_model(hidden_state, positions, is_prefill)
         # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), after run_model()")
 
         if self.tp_rank == 0:

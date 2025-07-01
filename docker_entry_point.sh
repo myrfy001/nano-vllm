@@ -45,4 +45,4 @@ VLLM_TORCH_PROFILER_DIR=/data/mmh/vllm_tracing
 
 
 pkill pt_main
-python example.py --node-num=16 --node-id=$1
+python example.py --node-num=3 --node-id=$1

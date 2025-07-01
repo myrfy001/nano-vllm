@@ -90,7 +90,7 @@ def serialize_context(
 def deserialize_context(
         buf_ptr,
         buf_stride: tl.constexpr,
-        is_prefill_ptr,
+        meta_ptr,
         slot_mapping_ptr, slot_mapping_size: tl.constexpr,
         context_lens_ptr, context_lens_size: tl.constexpr,
         block_tables_ptr, block_tables_size: tl.constexpr,
@@ -104,14 +104,20 @@ def deserialize_context(
     
     buf_ptr_as_u16 = buf_ptr.cast(tl.pointer_type(tl.uint16))
 
-    is_prefill_val = tl.load(buf_ptr)
-    tl.store(is_prefill_ptr, is_prefill_val)
-
+    is_prefill_val = tl.load(buf_ptr_as_u16)
     slot_mapping_len = tl.load(buf_ptr_as_u16 + 1)
     context_lens_len = tl.load(buf_ptr_as_u16 + 2)
     block_tables_len = tl.load(buf_ptr_as_u16 + 3)
     hidden_state_len = tl.load(buf_ptr_as_u16 + 4)
     positions_len = tl.load(buf_ptr_as_u16 + 5)
+
+    tl.store(meta_ptr, is_prefill_val)
+    tl.store(meta_ptr+1, slot_mapping_len)
+    tl.store(meta_ptr+2, context_lens_len)
+    tl.store(meta_ptr+3, block_tables_len)
+    tl.store(meta_ptr+4, hidden_state_len)
+    tl.store(meta_ptr+5, positions_len)
+
 
     buf_ptr += buf_stride
     buf_ptr_as_i32 = buf_ptr.cast(tl.pointer_type(tl.int32))
@@ -188,7 +194,7 @@ def invoke_serialize_context_kernel(
 
 def invoke_deserialize_context_kernel(
         buf: torch.Tensor,
-        is_prefill: torch.Tensor,
+        meta: torch.Tensor,
         slot_mapping: torch.Tensor,
         context_lens: torch.Tensor,
         block_tables: torch.Tensor,
@@ -200,7 +206,7 @@ def invoke_deserialize_context_kernel(
 
     deserialize_context[(1,)](
         buf, buf.stride(0),
-        is_prefill,
+        meta,
         slot_mapping, slot_mapping.size(0),
         context_lens, context_lens.size(0),
         block_tables, block_tables.size(0),
@@ -216,21 +222,21 @@ def test():
     src_slot_mapping_size = random.randint(1, 2048)
     src_context_lens_size = random.randint(1, 2048)
     src_block_tables_size = random.randint(1, 2048)
-    src_hidden_state_size = random.randint(1, 2048)
+    src_hidden_state_size = 256
     src_positions_size = random.randint(1, 1024)
 
     src_slot_mapping: torch.Tensor = torch.randint(1, 100, (src_slot_mapping_size,), dtype=torch.int32).cuda()
     src_context_lens: torch.Tensor = torch.randint(1, 100, (src_context_lens_size,), dtype=torch.int32).cuda()
     src_block_tables: torch.Tensor = torch.randint(1, 100, (src_block_tables_size,), dtype=torch.int32).cuda()
-    src_hidden_state: torch.Tensor = torch.rand((256, 7168), dtype=torch.float16).cuda()
+    src_hidden_state: torch.Tensor = torch.rand((src_hidden_state_size, 7168), dtype=torch.float16).cuda()
     src_positions: torch.Tensor = torch.randint(1, 100, (src_positions_size,), dtype=torch.int64).cuda()
 
     dst_slot_mapping: torch.Tensor = torch.randint(1, 100, (2048,), dtype=torch.int32).cuda()
     dst_context_lens: torch.Tensor = torch.randint(1, 100, (2048,), dtype=torch.int32).cuda()
     dst_block_tables: torch.Tensor = torch.randint(1, 100, (2048,), dtype=torch.int32).cuda()
-    dst_hidden_state: torch.Tensor = torch.rand((256,7168), dtype=torch.float16).cuda()
+    dst_hidden_state: torch.Tensor = torch.rand((src_hidden_state_size, 7168), dtype=torch.float16).cuda()
     dst_positions: torch.Tensor = torch.randint(1, 100, (1024,), dtype=torch.int64).cuda()
-    dst_is_prefill: torch.Tensor = torch.zeros(1, dtype=torch.uint8).cuda()
+    dst_meta: torch.Tensor = torch.zeros(8, dtype=torch.uint16).cuda()
 
     buf: torch.Tensor = torch.zeros((128,7168*2), dtype=torch.uint8).cuda()
 
@@ -241,9 +247,17 @@ def test():
         # print("src_slot_mapping=", src_slot_mapping)
         # print("buf=", buf)
 
-        invoke_deserialize_context_kernel(buf, dst_is_prefill, dst_slot_mapping, dst_context_lens, dst_block_tables, dst_hidden_state, dst_positions)
+        invoke_deserialize_context_kernel(buf, dst_meta, dst_slot_mapping, dst_context_lens, dst_block_tables, dst_hidden_state, dst_positions)
 
     # print("dst_slot_mapping=", dst_slot_mapping)
+
+    assert dst_meta[0] == 1
+    assert dst_meta[1] == src_slot_mapping_size
+    assert dst_meta[2] == src_context_lens_size
+    assert dst_meta[3] == src_block_tables_size
+    assert dst_meta[4] == src_hidden_state_size
+    assert dst_meta[5] == src_positions_size
+    
 
     assert torch.equal(src_slot_mapping, dst_slot_mapping[:src_slot_mapping_size])
     assert torch.equal(src_context_lens, dst_context_lens[:src_context_lens_size])
@@ -253,15 +267,17 @@ def test():
     assert torch.equal(src_hidden_state, dst_hidden_state)
 
 
-with torch.profiler.profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    schedule=torch.profiler.schedule(wait=0, warmup=1, active=30),
-    record_shapes=True,
-    with_stack=True,
-    profile_memory=True,
-) as prof:
-    for _ in range(5):
-        test()
-        prof.step()
+if __name__ == "__main__":
 
-prof.export_chrome_trace(f"tracing-serdes-test.json.gz")
+    with torch.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=0, warmup=1, active=30),
+        record_shapes=True,
+        with_stack=True,
+        profile_memory=True,
+    ) as prof:
+        for _ in range(5):
+            test()
+            prof.step()
+
+    prof.export_chrome_trace(f"tracing-serdes-test.json.gz")

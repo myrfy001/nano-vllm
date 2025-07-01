@@ -9,37 +9,37 @@ class PPNodeType:
     PPNodeLast = 2
 
 
-_node_id_to_layers_mapping = {
-    0: (10,14, PPNodeType.PPNodeMiddle),
-    # 1: (57,61, PPNodeType.PPNodeLast),
-}
+# _node_id_to_layers_mapping = {
+#     0: (10,14, PPNodeType.PPNodeFirst),
+#     1: (57,61, PPNodeType.PPNodeLast),
+# }
 
 # _node_id_to_layers_mapping = {
 #     0: (0,3, PPNodeType.PPNodeFirst),
 #     1: (57,61, PPNodeType.PPNodeLast),
 # }
 
-# _node_id_to_layers_mapping = {
-#     0: (0,3, PPNodeType.PPNodeFirst),
-#     1: (3,7, PPNodeType.PPNodeMiddle),
-#     2: (57,61, PPNodeType.PPNodeLast),
-# }
-
-
-
 _node_id_to_layers_mapping = {
     0: (0,3, PPNodeType.PPNodeFirst),
-    1: (3,9, PPNodeType.PPNodeMiddle),
-    2: (9,15, PPNodeType.PPNodeMiddle),
-    3: (15,21, PPNodeType.PPNodeMiddle),
-    4: (21,27, PPNodeType.PPNodeMiddle),
-    5: (27,33, PPNodeType.PPNodeMiddle),
-    6: (33,39, PPNodeType.PPNodeMiddle),
-    7: (39,45, PPNodeType.PPNodeMiddle),
-    8: (45,51, PPNodeType.PPNodeMiddle),
-    9: (51,57, PPNodeType.PPNodeMiddle),
-    10: (57,61, PPNodeType.PPNodeLast),
+    1: (3,7, PPNodeType.PPNodeMiddle),
+    2: (57,61, PPNodeType.PPNodeLast),
 }
+
+
+
+# _node_id_to_layers_mapping = {
+#     0: (0,3, PPNodeType.PPNodeFirst),
+#     1: (3,9, PPNodeType.PPNodeMiddle),
+#     2: (9,15, PPNodeType.PPNodeMiddle),
+#     3: (15,21, PPNodeType.PPNodeMiddle),
+#     4: (21,27, PPNodeType.PPNodeMiddle),
+#     5: (27,33, PPNodeType.PPNodeMiddle),
+#     6: (33,39, PPNodeType.PPNodeMiddle),
+#     7: (39,45, PPNodeType.PPNodeMiddle),
+#     8: (45,51, PPNodeType.PPNodeMiddle),
+#     9: (51,57, PPNodeType.PPNodeMiddle),
+#     10: (57,61, PPNodeType.PPNodeLast),
+# }
 
 
 

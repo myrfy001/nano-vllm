@@ -2,7 +2,7 @@ from fabric import Connection, Config, ThreadingGroup
 from threading import Thread
 
 shutdown_hosts = [(f"10.18.17.{i+141}", f"h02r3n{i:02d}") for i in range(3, 3+15)]
-hosts = [(f"10.18.17.{i+141}", f"h02r3n{i:02d}") for i in range(3, 3+15)]
+hosts = [(f"10.18.17.{i+141}", f"h02r3n{i:02d}") for i in range(3, 3+2)]
 password = "XaNjj@##Apir!"
 
 
