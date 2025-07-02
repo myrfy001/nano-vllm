@@ -7,6 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import torch.cuda.nvtx as nvtx
 
 from nanovllm.layers.fused_moe import FusedMoE
 from nanovllm.layers.kernel import act_quant, weight_dequant, fp8_gemm
@@ -14,6 +15,9 @@ from nanovllm.utils.context import get_context
 from nanovllm.layers.attention import store_kvcache
 from nanovllm.config import PPNodeType
 from nanovllm.utils.context import get_context, get_tp_rank, get_tp_world_size, get_tp_group
+import nanovllm.layers.ds_offical_model as model
+from nanovllm.layers.mla import mla_decode
+from nanovllm.layers.gemv_awq import gemv
 
 world_size = 1
 rank = 0
@@ -134,8 +138,23 @@ class ParallelEmbedding(nn.Module):
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-    assert weight.is_contiguous()
-    return F.linear(x, weight, bias)
+    
+    try:
+        assert weight.is_contiguous()
+        ret = torch.empty(1, weight.size(0), device=x.device, dtype=x.dtype)
+        x_shape = x.shape[:-1]
+        tb = bias
+        if bias is not None:
+            tb = bias.reshape(bias.size(-1))
+        tx = x.reshape(x.size(-1))
+        gemv(tx, weight, tb, ret)
+        ret = ret.reshape(*x_shape, weight.size(0))
+        
+    except:
+        import traceback
+        traceback.print_exc()
+        import pdb;pdb.set_trace()
+    return ret
 
 
 
@@ -528,9 +547,9 @@ class Z100_MLA(nn.Module):
         self.cache_size = args.max_batch_size * args.max_position_embeddings
         self.page_size = 1
         self.register_buffer("kv_c_and_k_pe_cache", torch.randn(self.cache_size // self.page_size, self.page_size, 1, self.kv_lora_rank + self.qk_rope_head_dim), persistent=False)
-        kv_cache, pe_cache = self.kv_c_and_k_pe_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        self.register_buffer("kv_cache", kv_cache.view(args.max_batch_size, args.max_position_embeddings, self.kv_lora_rank), persistent=False)
-        self.register_buffer("pe_cache", pe_cache.view(args.max_batch_size, args.max_position_embeddings, self.qk_rope_head_dim), persistent=False)
+        # kv_cache, pe_cache = self.kv_c_and_k_pe_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # self.register_buffer("kv_cache", kv_cache.view(args.max_batch_size, args.max_position_embeddings, self.kv_lora_rank), persistent=False)
+        # self.register_buffer("pe_cache", pe_cache.view(args.max_batch_size, args.max_position_embeddings, self.qk_rope_head_dim), persistent=False)
 
         kv_b_proj_weight = self.wkv_b.weight.T
 
@@ -661,7 +680,6 @@ class Z100_Block(nn.Module):
         self.ffn = MLP(args.hidden_size, args.intermediate_size) if layer_id < args.first_k_dense_replace else Z100_MoE(args, nanovllm_config)
         self.attn_norm = RMSNorm(args.hidden_size)
         self.ffn_norm = RMSNorm(args.hidden_size)
-        self.fake_op = MLP(args.hidden_size, args.intermediate_size)
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -677,10 +695,12 @@ class Z100_Block(nn.Module):
             torch.Tensor: Output tensor after block computation.
         """
             
-        # x = x + self.attn(self.attn_norm(x), positions, freqs_cis, mask)
-        # x = x + self.ffn(self.ffn_norm(x))
-
-        x = self.fake_op(x)
+        context = get_context()
+        if context.is_prefill:
+            return x
+        else:
+            x = x + self.attn(self.attn_norm(x), positions, freqs_cis, mask)
+            x = x + self.ffn(self.ffn_norm(x))
         return x
 
 
@@ -733,6 +753,7 @@ class DeepseekV3ForCausalLLM(nn.Module):
         args.beta_slow = 1
         args.rope_theta = 10000
         args.max_batch_size = 1
+        self.args = args
 
         pp_start_layer_id, pp_end_layer_id, pp_node_type = nanovllm_config.pp_schema
 
@@ -856,7 +877,11 @@ class DeepseekV3ForCausalLLMLast(DeepseekV3ForCausalLLM):
         # print(f"{time.time()}, rank={get_tp_rank()}, DeepseekV3ForCausalLLMLast's forward before norm, h={h}")
 
         h = self.norm(h)
-        logits = self.head(h)
+
+        if context.is_prefill:
+            logits = torch.randn(list(h.shape[:-1]) + [self.args.vocab_size], device=h.device, dtype=h.dtype)
+        else:
+            logits = self.head(h)
 
         all_logits = [torch.empty_like(logits) for _ in range(world_size)]
         dist.all_gather(all_logits, logits, group=get_tp_group())

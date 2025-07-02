@@ -33,7 +33,7 @@ class ModelRunner:
         self.mp_queue = mp_queue
         self.device = torch.device("cuda", self.tp_rank)
 
-        self.buf_tensor = torch.empty((128,7168*2), dtype=torch.uint8, device=self.device)
+        self.buf_tensor = torch.empty((32, 7168*2), dtype=torch.uint8, device=self.device)
         self.meta_buf = torch.empty(8, dtype=torch.uint16, device=self.device)
         self.slot_mapping_buf = torch.empty([2048,], dtype=torch.int32, device=self.device)
         self.context_lens_buf = torch.empty([2048,], dtype=torch.int32, device=self.device)
@@ -198,13 +198,13 @@ class ModelRunner:
                     context.is_prefill, context.slot_mapping, context.context_lens, context.block_tables, hidden_state, positions, self.buf_tensor
                 )
 
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
             torch.cuda.synchronize()
             dist.send(self.buf_tensor, self.next_pp_head_node_global_rank)
             torch.cuda.synchronize()
         else:
             # for last node, send logits instead of hidden state
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} logits", flush=True)
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} logits", flush=True)
             torch.cuda.synchronize()
             dist.send(hidden_state, self.next_pp_head_node_global_rank)
             torch.cuda.synchronize()
@@ -213,12 +213,12 @@ class ModelRunner:
         assert self.tp_rank == 0
 
         if self.pp_node_type != PPNodeType.PPNodeFirst:
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
             dist.recv(self.buf_tensor, self.prev_pp_head_node_global_rank)
             torch.cuda.synchronize()
         else:
             assert logit_tensor is not None
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={logit_tensor.size()}, dtype={logit_tensor.dtype} logit_tensor", flush=True)
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={logit_tensor.size()}, dtype={logit_tensor.dtype} logit_tensor", flush=True)
             dist.recv(logit_tensor, self.prev_pp_head_node_global_rank)
             torch.cuda.synchronize()
             

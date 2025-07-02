@@ -46,24 +46,35 @@ def store_kvcache_kernel(
     kv_pe_cache_ptr,
     slot_mapping_ptr,
     D: tl.constexpr,
+    head_dim: tl.constexpr,
 ):
     idx = tl.program_id(0)
-    kv_pe_offsets = idx * kv_pe_stride + tl.arange(0, D)
-    kv_pe = tl.load(kv_pe_ptr + kv_pe_offsets)
+
+    element_offset = tl.arange(0, D)
+    mask = element_offset < head_dim
+
+    kv_pe_offsets = idx * kv_pe_stride + element_offset
+    kv_pe = tl.load(kv_pe_ptr + kv_pe_offsets, mask=mask)
     slot = tl.load(slot_mapping_ptr + idx)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(kv_pe_cache_ptr + cache_offsets, kv_pe)
+
+    
+    cache_offsets = slot * head_dim + element_offset
+    
+    tl.store(kv_pe_cache_ptr + cache_offsets, kv_pe, mask=mask)
 
 
 def store_kvcache(kv_pe: torch.Tensor, kv_pe_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
     N, num_heads, head_dim = kv_pe.shape
-    D = num_heads * head_dim
+    assert N == 1
+    assert num_heads == 1 # for MLA, the kv cache is compressed
+    D = 1024
+    assert D >= head_dim
     assert kv_pe.stride(-1) == 1 
     assert kv_pe.stride(1) == head_dim
-    assert kv_pe_cache.stride(1) == D 
+    assert kv_pe_cache.stride(1) == head_dim
     assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](kv_pe, kv_pe.stride(0), kv_pe_cache, slot_mapping, D)
+    store_kvcache_kernel[(N,)](kv_pe, kv_pe.stride(0), kv_pe_cache, slot_mapping, D, head_dim)
 
 class Attention(nn.Module):
 

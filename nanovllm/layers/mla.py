@@ -5,15 +5,14 @@ import triton.language as tl
 from typing import Any, Dict, Optional, Tuple
 from torch.profiler import ProfilerActivity
 
-
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE_H": h, "BLOCK_SIZE_N": n, "BLOCK_SIZE_D1": d1, "BLOCK_SIZE_D2": d2}, num_warps=4, num_stages=1)
         for h in [1]
         # for h in [1, 16]
-        for n in [64]
+        for n in [1]
         # for n in [16, 32, 64]
-        for d1 in [64]
+        for d1 in [512]
         # for d1 in [16, 32, 64, 128, 256, 512]
         for d2 in [64]
         # for d2 in [16, 32, 64]
@@ -360,13 +359,51 @@ def generate_tokens(B: int, Skv: int, CACHE_SIZE = 16384, PAGE_SIZE = 1) -> Tupl
     return req_to_tokens, b_seq_len
 
 
+def torch_ref(q, kv_c_and_k_pe_cache: torch.Tensor, Skv: int, sm_scale) -> torch.Tensor:
+    bsz = 1
+    Lkv, R = 512, 64
+    start_pos = Skv - 1
+
+    q = q.unsqueeze(0)
+    q_nope, q_pe = q.split([Lkv, R], dim=-1)
+    kv_c_normed = torch.randn([1, 1, Lkv])
+    k_pe = torch.randn([1, 1, 1, R])
+    kv_c_and_k_pe = torch.cat([kv_c_normed, k_pe.squeeze(2)], dim=-1)  # [1, 1, 512 + 64]
+
+    kv_cache_view, pe_cache_view = kv_c_and_k_pe_cache.split([Lkv, R], dim=-1)
+    kv_cache_view = kv_cache_view.view(1, -1, Lkv)
+    pe_cache_view = pe_cache_view.view(1, -1, R)
+    # print(f'{kv_cache[:Skv, :].shape=}')
+    # print(f'{q_nope.shape=}')
+    # print(f'{q_pe.shape=}')
+    kv_cache = kv_cache_view.detach().clone()
+    pe_cache = pe_cache_view.detach().clone()
+
+    page_start, page_end = start_pos, Skv
+    kv_c_and_k_pe_cache[page_start:page_end] = kv_c_and_k_pe
+
+    kv_cache[:bsz, start_pos:Skv] = kv_c_normed
+    pe_cache[:bsz, start_pos:Skv] = k_pe.squeeze(2)
+
+    torch.testing.assert_close(kv_cache, kv_cache_view)
+    torch.testing.assert_close(pe_cache, pe_cache_view)
+
+    scores = (torch.einsum("bshc,btc->bsht", q_nope, kv_cache[:bsz, :Skv]) +
+                torch.einsum("bshr,btr->bsht", q_pe, pe_cache[:bsz, :Skv])) * sm_scale
+
+    scores = scores.softmax(dim=-1, dtype=torch.float32).to(torch.float16)
+    x = torch.einsum("bsht,btc->bshc", scores, kv_cache[:bsz, :Skv]).squeeze(1)
+    return x
+
+
 def check_mla_decode(q, kv_c_and_k_pe_cache, kv_c_cache, o, Skv: int, split_k: int = 8) -> None:
-    from vllm.attention.ops.triton_decode_attention import decode_attention_fwd
+    # from vllm.attention.ops.triton_decode_attention import decode_attention_fwd
     B, N, Lkv = o.shape
     _, _, Lq  = q.shape
     R = Lq - Lkv
 
     req_to_tokens, b_seq_len = generate_tokens(B, Skv, Lkv, R)
+    req_to_tokens = torch.arange(0, Skv, dtype=torch.int32).broadcast_to(req_to_tokens.size())
     sm_scale = 1.0 / ((Lkv + R) ** 0.5)
     ref = torch.empty(B, N, Lkv)
     attn_logits = torch.empty(
@@ -375,18 +412,53 @@ def check_mla_decode(q, kv_c_and_k_pe_cache, kv_c_cache, o, Skv: int, split_k: i
         device="cuda",
     )
 
-    decode_attention_fwd(
-        q,
-        kv_c_and_k_pe_cache,
-        kv_c_cache,
-        ref,
-        req_to_tokens,
-        b_seq_len,
-        attn_logits,
-        split_k,
-        sm_scale,
-        best_config=None,
-    )
+    # decode_attention_fwd(
+    #     q,
+    #     kv_c_and_k_pe_cache,
+    #     kv_c_cache,
+    #     ref,
+    #     req_to_tokens,
+    #     b_seq_len,
+    #     attn_logits,
+    #     split_k,
+    #     sm_scale,
+    #     # best_config=None,
+    # )
+
+    ref = torch_ref(q, kv_c_and_k_pe_cache, Skv, sm_scale)
+    # print(f"REF {ref=}")
+
+    if False:
+        configs = [
+            {
+                "BLOCK_SIZE_H": h,
+                "BLOCK_SIZE_N": n,
+                "BLOCK_SIZE_D1": d1,
+                "BLOCK_SIZE_D2": d2,
+                "SPLIT_K": k,
+                "num_warps": 4,
+                "num_stages": 1,
+            }
+            for h in [1]
+            for n in [16, 32, 64, 128]
+            for d1 in [16, 32, 64, 128, 256, 512]
+            for d2 in [16, 32, 64]
+            for k in [1, 2, 4, 8]
+        ]
+        for config in configs:
+            mla_decode(
+                q,
+                kv_c_and_k_pe_cache,
+                kv_c_cache,
+                o,
+                req_to_tokens,
+                b_seq_len,
+                sm_scale,
+                config=config,
+            )
+            if torch.allclose(o, ref, atol=1e-2, rtol=1e-2):
+                print(f'pass {config=}')
+        return
 
     mla_decode(
         q,
@@ -395,10 +467,14 @@ def check_mla_decode(q, kv_c_and_k_pe_cache, kv_c_cache, o, Skv: int, split_k: i
         o,
         req_to_tokens,
         b_seq_len,
+        sm_scale,
         config={'SPLIT_K': split_k},
     )
 
-    torch.testing.assert_close(o, ref, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(o, ref, atol=1e-2, rtol=1e-2)
+    print("PASS MLA CHECK")
+    print(f'{o=}')
+    print(f'{ref=}')
 
 
 def test_mla_decode(check: bool = False, seq_len: int = -1, split_k = -1):
@@ -408,11 +484,12 @@ def test_mla_decode(check: bool = False, seq_len: int = -1, split_k = -1):
     N = 128
     Lkv = 512
     R = 64
-    Skv = seq_len if seq_len != -1 else 4096
+    Skv = seq_len if seq_len != -1 else 64
     SPLIT_K = split_k if split_k != -1 else 8
+    sm_scale = 1 / ((Lkv + R) ** 0.5)
 
     kv_c_and_k_pe_cache = torch.randn([CACHE_SIZE // PAGE_SIZE, PAGE_SIZE, 1, Lkv + R])
-    kv_c_cache = torch.randn([CACHE_SIZE // PAGE_SIZE, PAGE_SIZE, 1, Lkv])
+    kv_c_cache, pe_cache = kv_c_and_k_pe_cache.split([Lkv, R], dim=-1)
 
     q_nope = torch.randn([B, N, Lkv])
     q_pe = torch.randn([B, N, R])
@@ -422,6 +499,7 @@ def test_mla_decode(check: bool = False, seq_len: int = -1, split_k = -1):
 
     if check:
         check_mla_decode(q, kv_c_and_k_pe_cache, kv_c_cache, o, Skv, SPLIT_K)
+        return
 
     Skvs = [2 ** i for i in range(15)] if seq_len == -1 else [seq_len]
     split_ks = [2 ** i for i in range(0, 6, 1)] if split_k == -1 else [split_k]
@@ -457,6 +535,7 @@ def test_mla_decode(check: bool = False, seq_len: int = -1, split_k = -1):
                     o,
                     req_to_tokens,
                     b_seq_len,
+                    sm_scale,
                     config=config,
                 ),
                 quantiles=quantiles,
@@ -483,6 +562,7 @@ def test_mla_decode(check: bool = False, seq_len: int = -1, split_k = -1):
                 o,
                 req_to_tokens,
                 b_seq_len,
+                sm_scale,
                 config=config,
             )
             prof.step()
