@@ -46,6 +46,8 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        
+        prompt.pop(0)  # TODO: FIXME  给到的测试kvcache 只有一个BOS，而这里貌似会切出来两个BOS
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
@@ -108,7 +110,7 @@ class LLMEngine:
                 #     break
 
 
-        if True:
+        if False:
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 schedule=torch.profiler.schedule(wait=0, warmup=10, active=300),

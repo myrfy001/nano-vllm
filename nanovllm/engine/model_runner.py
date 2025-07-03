@@ -65,6 +65,7 @@ class ModelRunner:
         
 
         pp_start_layer_id, pp_end_layer_id, pp_node_type = config.pp_schema
+        self.pp_start_layer_id = pp_start_layer_id
 
 
         torch.cuda.set_device(tp_rank)
@@ -91,9 +92,11 @@ class ModelRunner:
 
         
         # load_model(self.model, config.model, tp_size=config.tensor_parallel_size, local_rank=tp_rank, start_layer=pp_start_layer_id, end_layer=pp_end_layer_id)
-        self.model.load_weight(config.model)
+        self.model.load_weight(config.model, start_layer=pp_start_layer_id, end_layer=pp_end_layer_id)
         self.pp_node_type = pp_node_type
 
+        self.sampler = Sampler()
+        self.allocate_kv_cache(config.gpu_memory_utilization)
 
         print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in ModelRunner __init__ before global barrier", flush=True)
         dist.barrier()
@@ -101,12 +104,13 @@ class ModelRunner:
 
         # import pdb; pdb.set_trace()
 
-        self.sampler = Sampler()
-        self.allocate_kv_cache(config.gpu_memory_utilization)
+
+
         if not self.enforce_eager:
             self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+
+        # torch.set_default_device("cpu")
+        # torch.set_default_dtype(default_dtype)
 
         
         if self.tp_world_size > 1:
@@ -140,7 +144,7 @@ class ModelRunner:
 
 
     def loop(self):
-        if True:
+        if False:
             prof_early_break_counter = 0
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -192,20 +196,18 @@ class ModelRunner:
         assert self.tp_rank == 0
 
         if self.pp_node_type != PPNodeType.PPNodeLast:
-            with torch.profiler.record_function("do serialize"):
-                
-                
-                invoke_serialize_context_kernel(
-                    context.is_prefill, context.slot_mapping, context.context_lens, context.block_tables, hidden_state, positions, self.buf_tensor
-                )
 
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
+            invoke_serialize_context_kernel(
+                context.is_prefill, context.slot_mapping, context.context_lens, context.block_tables, hidden_state, positions, self.buf_tensor
+            )
+
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
             torch.cuda.synchronize()
             dist.send(self.buf_tensor, self.next_pp_head_node_global_rank)
             torch.cuda.synchronize()
         else:
             # for last node, send logits instead of hidden state
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} logits", flush=True)
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} logits", flush=True)
             torch.cuda.synchronize()
             dist.send(hidden_state, self.next_pp_head_node_global_rank)
             torch.cuda.synchronize()
@@ -214,12 +216,12 @@ class ModelRunner:
         assert self.tp_rank == 0
 
         if self.pp_node_type != PPNodeType.PPNodeFirst:
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
             dist.recv(self.buf_tensor, self.prev_pp_head_node_global_rank)
             torch.cuda.synchronize()
         else:
             assert logit_tensor is not None
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={logit_tensor.size()}, dtype={logit_tensor.dtype} logit_tensor", flush=True)
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={logit_tensor.size()}, dtype={logit_tensor.dtype} logit_tensor", flush=True)
             dist.recv(logit_tensor, self.prev_pp_head_node_global_rank)
             torch.cuda.synchronize()
             
@@ -253,18 +255,18 @@ class ModelRunner:
                 self.write_shm(method_name, *args)
             elif method_name == "run_non_first_node":
                 self.write_shm(method_name)
-                print(f"{time.time()}, rank{self.tp_rank},{self.rank}, send serialized data by broadcast, src={self.rank}", flush=True)
+                # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, send serialized data by broadcast, src={self.rank}", flush=True)
                 dist.broadcast(self.buf_tensor, src=self.rank, group=self.tp_group)
-                print(f"{time.time()}, rank{self.tp_rank},{self.rank}, finish send serialized data by broadcast, src={self.rank}", flush=True)
+                # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, finish send serialized data by broadcast, src={self.rank}", flush=True)
             else:
                 raise Exception("Not supported function call")
             
         if self.tp_rank > 0:
             if method_name == "run_non_first_node":
                 # recv serialized data
-                print(f"{time.time()}, rank{self.tp_rank},{self.rank}, recv serialized data by broadcast, src={self.rank-self.tp_rank}", flush=True)
+                # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, recv serialized data by broadcast, src={self.rank-self.tp_rank}", flush=True)
                 dist.broadcast(self.buf_tensor, src=self.rank-self.tp_rank, group=self.tp_group)
-                print(f"{time.time()}, rank{self.tp_rank},{self.rank}, after recv serialized data by broadcast, src={self.rank-self.tp_rank}", flush=True)
+                # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, after recv serialized data by broadcast, src={self.rank-self.tp_rank}", flush=True)
                 args = (self.buf_tensor,)
 
         method = getattr(self, method_name, None)
@@ -290,14 +292,24 @@ class ModelRunner:
         self.kv_cache = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, kv_cache_head_dim)
         # self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         
-        layer_id = 0
+        from safetensors import safe_open
+        with safe_open("small_phase0_seqlen4_start0.safetensor", "pt", "cpu") as safetensor_file:
+            loaded_kv_cache = safetensor_file.get_tensor("out_kvcache")
+            self.kv_cache[:,:4] = loaded_kv_cache.to(self.device)
+
+        if self.rank == 0:
+            print(f"loaded kv cache = {loaded_kv_cache}")
+            print(f"self.kv_cache for first layer = {self.kv_cache[0]}")
+            
+
+        layer_id = self.pp_start_layer_id
         for module in self.model.modules():
             # if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
             #     module.k_cache = self.kv_cache[0, layer_id]
             #     module.v_cache = self.kv_cache[1, layer_id]
             #     layer_id += 1
             if hasattr(module, "kv_c_and_k_pe_cache"):
-                module.k_cache = self.kv_cache[layer_id]
+                module.kv_c_and_k_pe_cache = self.kv_cache[layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -353,12 +365,17 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
         return input_ids, positions
 
+    @torch.inference_mode()
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
+
+        
+        
         for seq in seqs:
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), seq.block_table={seq.block_table}, seq.last_block_num_tokens={seq.last_block_num_tokens}, seq.num_cached_blocks={seq.num_cached_blocks}")
             input_ids.append(seq.last_token)
             positions.append(len(seq))
             context_lens.append(len(seq))
@@ -376,6 +393,12 @@ class ModelRunner:
 
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
 
+        self.graph_vars["slot_mapping"][0] = slot_mapping[0]
+        self.graph_vars["context_lens"][0] = context_lens[0]
+        self.graph_vars["block_tables"][0][:block_tables.size(1)] = block_tables
+        self.graph_vars["input_tensor"][0] = input_ids[0]
+        self.graph_vars["positions"][0] = positions[0]
+
         # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), before return input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
         return input_ids, positions
 
@@ -388,7 +411,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_tensor: torch.Tensor, positions: torch.Tensor, is_prefill):
-        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() begin, is_prefill={is_prefill}, self.enforce_eager={self.enforce_eager}, nput_tensor.size={input_tensor.size()}", flush=True)
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() begin, is_prefill={is_prefill}, self.enforce_eager={self.enforce_eager}, nput_tensor.size={input_tensor.size()}", flush=True)
         if is_prefill or self.enforce_eager or input_tensor.size(0) > 512:
             # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model run, input_tensor={input_tensor}, {input_tensor.size()}, positions={positions}, {positions.size()}")
             hidden_state = self.model(input_tensor, positions)
@@ -404,8 +427,8 @@ class ModelRunner:
             # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model(), cuda-graph run path enter")
             bs = 1 # TODO: FIXME 
             # bs = input_tensor.size(0)
-            # context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            
+            # graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             # for k, v in graph_vars.items():
             #     if k != "outputs":
@@ -420,23 +443,54 @@ class ModelRunner:
             #     f'block_tables: {graph_vars["block_tables"].size()}, {context.block_tables.size()}, '
             # )
 
-            # graph_vars["input_tensor"][:bs] = input_tensor
-            # graph_vars["positions"][:bs] = positions
-            # graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            # graph_vars["context_lens"][:bs] = context.context_lens
-            # graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # if self.pp_node_type == PPNodeType.PPNodeFirst:
+            #     context = get_context()
+            #     graph_vars["input_tensor"][:bs] = input_tensor
+            #     graph_vars["positions"][:bs] = positions
+            #     graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            #     graph_vars["context_lens"][:bs] = context.context_lens
+            #     graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
 
-            print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model replay', flush=True)
-            graph.replay()
+            if self.rank == 0:
+                # print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model replay, graph_vars={graph_vars}', flush=True)
+                print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model replay, kvcache={self.kv_cache[1]}', flush=True)
+
+            # graph.replay()
+            
+            graph_vars["outputs"][:bs] = self.model(graph_vars["input_tensor"][:bs], graph_vars["positions"][:bs])
+
             torch.cuda.synchronize()
-            print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() after model replay', flush=True)
+            # print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() after model replay', flush=True)
 
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         assert self.pp_node_type == PPNodeType.PPNodeFirst
         
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        if is_prefill:
+            # input_ids, positions = self.prepare_prefill(seqs)
+
+            from safetensors import safe_open
+            with safe_open("small_phase0_seqlen4_start0.safetensor", "pt", "cpu") as safetensor_file:
+                loaded_logit = safetensor_file.get_tensor("out_logits")
+                loaded_token_ids = safetensor_file.get_tensor("tokens")
+                token_id = loaded_logit.argmax(dim=-1)
+
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run() prefill before modify seq, seqs[0].token_ids={seqs[0].token_ids}, num_tokens={seqs[0].num_tokens}, num_prompt_tokens={seqs[0].num_prompt_tokens}, num_cached_tokens={seqs[0].num_cached_tokens}, block_table={seqs[0].block_table}")
+
+            seqs[0].token_ids = loaded_token_ids[0].tolist()
+            seqs[0].num_tokens = len(seqs[0].token_ids)
+            seqs[0].num_prompt_tokens = len(seqs[0].token_ids)
+            seqs[0].num_cached_tokens = len(seqs[0].token_ids)
+            seqs[0].block_table = [i for i in range(len(seqs[0].token_ids))]
+
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run() prefill after modify seq, seqs[0].token_ids={seqs[0].token_ids}")
+            
+            token_ids = [int(token_id[0])]
+            return token_ids
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+
 
         # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), positions={positions}, {positions.device}, is_prefill={is_prefill}, input_ids={input_ids}")
         # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), positions size={positions.size()}, input_ids size={input_ids.size()}")
@@ -563,18 +617,18 @@ class ModelRunner:
 
         # print(f"{time.time()}, rank{self.tp_rank} in capture graph, positions={positions}, {positions.device}")
 
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_tensor[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                hidden_state = self.model(input_tensor[:bs], positions[:bs])    # capture
-                outputs[:bs] = hidden_state
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
+        # for bs in reversed(self.graph_bs):
+        #     graph = torch.cuda.CUDAGraph()
+        #     set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+        #     outputs[:bs] = self.model(input_tensor[:bs], positions[:bs])    # warmup
+        #     with torch.cuda.graph(graph, self.graph_pool):
+        #         hidden_state = self.model(input_tensor[:bs], positions[:bs])    # capture
+        #         outputs[:bs] = hidden_state
+        #     if self.graph_pool is None:
+        #         self.graph_pool = graph.pool()
+        #     self.graphs[bs] = graph
+        #     torch.cuda.synchronize()
+        #     reset_context()
 
         self.graph_vars = dict(
             input_tensor=input_tensor,

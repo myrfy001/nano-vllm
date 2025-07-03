@@ -18,7 +18,6 @@ from nanovllm.utils.context import get_context
 from nanovllm.layers.attention import store_kvcache
 from nanovllm.config import PPNodeType
 from nanovllm.utils.context import get_context, get_tp_rank, get_tp_world_size, get_tp_group
-import nanovllm.layers.ds_offical_model as model
 from nanovllm.layers.mla import mla_decode
 from nanovllm.layers.gemv_awq import gemv
 
@@ -458,6 +457,70 @@ class MLP(nn.Module):
             torch.Tensor: Output tensor after MLP computation.
         """
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    
+    def load_from_safetensor(
+        self,
+        safetensor_file,
+        original_weight_name: str,
+        layer_id: int,
+        tp_rank: int,
+        already_loaded_set,
+    ):
+        
+        # ['model', 'layers', '0', 'mlp', 'up_proj', 'qweight']
+        # ['model', 'layers', '3', 'mlp', 'shared_experts', 'down_proj', 'qweight']
+        original_weight_name_parts = original_weight_name.split('.')
+
+        assert original_weight_name_parts[3] == 'mlp'
+        assert int(original_weight_name_parts[2]) == layer_id
+        assert (0 <= layer_id < 3  and len(original_weight_name_parts) == 6) or \
+               (3 <= layer_id < 61 and len(original_weight_name_parts) == 7 and
+                original_weight_name_parts[4] == 'shared_experts')
+
+        load_dedup_key = '.'.join(original_weight_name_parts[:-1])
+        if load_dedup_key in already_loaded_set:
+            return
+
+        original_qweight_name = ".".join(original_weight_name_parts[:-1] + ["qweight"])
+        original_scale_name = ".".join(original_weight_name_parts[:-1] + ["scales"])
+        original_zero_name = ".".join(original_weight_name_parts[:-1] + ["qzeros"])
+        is_quantized = original_qweight_name in safetensor_file.keys() and \
+                    original_scale_name in safetensor_file.keys() and \
+                    original_zero_name in safetensor_file.keys()
+        assert is_quantized
+
+        loaded_tensor_weight = safetensor_file.get_tensor(original_qweight_name)
+        loaded_tensor_scale = safetensor_file.get_tensor(original_scale_name)
+        loaded_tensor_zero = safetensor_file.get_tensor(original_zero_name)
+
+        dequant_tensor = awq_dequantize_triton(loaded_tensor_weight, loaded_tensor_scale, loaded_tensor_zero)
+
+        NAME_TO_SHARDED_ID = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+
+        # ['up_proj', 'qweight']
+        # ['down_proj', 'qweight']
+        weight_name_parts = original_weight_name_parts[-2:]
+
+        name = weight_name_parts[0]
+        shard_id = NAME_TO_SHARDED_ID[name]
+        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+
+        param_path = f'{shard_id}.weight'
+        # print(f"{param_path=}, {weight_name=}, {original_weight_name=}, {dequant_tensor.shape=}")
+        expert_data = get_param_from_model(self, param_path)
+        if expert_data is None:
+            print(f"Warning: Parameter {param_path} not found in model.")
+            return
+
+        # tp=1 w1 [2048x7168] -> dim=0 -> Get 2048
+        # tp=4 w1 [512x7168] -> dim=0 -> Get 512
+        shard_size = expert_data.shape[shard_dim]
+        assert dequant_tensor.shape[1 - shard_dim] == shard_size * world_size
+
+        weight_shard = dequant_tensor.narrow(1 - shard_dim, shard_size * tp_rank, shard_size)
+        expert_data.T.copy_(weight_shard)
+        already_loaded_set.add(load_dedup_key)
 
 
 class Z100_MoE(nn.Module):
@@ -497,6 +560,7 @@ class Z100_MoE(nn.Module):
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
         self.gate = Linear(args.hidden_size, args.n_routed_experts, bias=True)
+        self.gate.e_score_correction_bias = nn.Parameter(torch.empty([args.n_routed_experts], dtype=torch.float16), requires_grad=False)
         self.experts = FusedMoE(
             num_experts=args.n_routed_experts,
             top_k=args.num_experts_per_tok,
@@ -506,6 +570,7 @@ class Z100_MoE(nn.Module):
             renormalize=True,
             use_grouped_topk=True,
             num_expert_group=args.n_group,
+            e_score_correction_bias=self.gate.e_score_correction_bias,
             topk_group=args.topk_group,
             tp_size=nanovllm_config.tensor_parallel_size,
         )
@@ -579,7 +644,7 @@ class Z100_MoE(nn.Module):
                     layer = int(weight_name.split('.')[2])
                     if layer != layer_id:
                         continue
-                    self.load_from_safetensor(safetensor_file, weight_name, layer_id, model.rank, already_loaded_set)
+                    self.load_from_safetensor(safetensor_file, weight_name, layer_id, rank, already_loaded_set)
 
     def load_from_safetensor(
         self,
@@ -705,18 +770,18 @@ class Z100_MLA(nn.Module):
         self.v_head_dim = args.v_head_dim
 
         # q_a_proj [7168x1536]
-        self.wq_a = Linear(self.dim, self.q_lora_rank)
-        self.q_norm = RMSNorm(self.q_lora_rank)
+        self.q_a_proj = Linear(self.dim, self.q_lora_rank)
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank)
         # [1536x(128 * (128 + 64))]
-        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+        self.q_b_proj = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
 
         # [7168x(512 + 64)]
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
-        self.kv_norm = RMSNorm(self.kv_lora_rank)
+        self.kv_a_proj_with_mqa = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank)
         # [512x(128 * (128 + 128))]
-        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+        self.kv_b_proj = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
         # [(128 * 128)x7168]
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        self.o_proj = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_position_embeddings > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
@@ -729,7 +794,7 @@ class Z100_MLA(nn.Module):
         # self.register_buffer("kv_cache", kv_cache.view(args.max_batch_size, args.max_position_embeddings, self.kv_lora_rank), persistent=False)
         # self.register_buffer("pe_cache", pe_cache.view(args.max_batch_size, args.max_position_embeddings, self.qk_rope_head_dim), persistent=False)
 
-        kv_b_proj_weight = self.wkv_b.weight.T
+        kv_b_proj_weight = self.kv_b_proj.weight.T
 
         kv_b_proj_weight = kv_b_proj_weight.view(
             self.kv_lora_rank,
@@ -751,11 +816,11 @@ class Z100_MLA(nn.Module):
         x = torch.bmm(x, self.W_UV)
         # Convert from (N, B, V) to (B, N * V)
         x = x.transpose(0, 1).reshape(-1, self.n_local_heads * self.v_head_dim)
-        return self.wo(x)
+        return self.o_proj(x)
 
     # Return `ql_nope`, `q_pe`
     def _q_proj_and_k_up_proj(self, x):
-        q = self.wq_b(x) # [1x(128 * (128 + 64))]
+        q = self.q_b_proj(x) # [1x(128 * (128 + 64))]
         # print(f'MLA: {q=}')
         q = q.view(-1, self.n_local_heads, self.qk_head_dim) # [1, 128, 192]
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -785,13 +850,13 @@ class Z100_MLA(nn.Module):
         # x = x.squeeze(0) # [1x7168]
 
         # Get Q, K, V
-        ckq = self.wq_a(x) # [1x1536]
-        kv = self.wkv_a(x) # [1x576]
+        ckq = self.q_a_proj(x) # [1x1536]
+        kv = self.kv_a_proj_with_mqa(x) # [1x576]
         kv_c, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
         # Normalize Q and KV
-        q_c = self.q_norm(ckq) # [1x1536]
-        kv_c_normed = self.kv_norm(kv_c) # [1x512]
+        q_c = self.q_a_layernorm(ckq) # [1x1536]
+        kv_c_normed = self.kv_a_layernorm(kv_c) # [1x512]
 
         q_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
 
@@ -807,7 +872,16 @@ class Z100_MLA(nn.Module):
         assert self.page_size == 1
 
         context = get_context()
+        if rank == 0:
+            print(f"in decode forward, before update kvcache. self.kv_c_and_k_pe_cache={self.kv_c_and_k_pe_cache}")
+            print(f"in decode forward, before update kvcache. context.slot_mapping={context.slot_mapping}")
+        
+
+        
         store_kvcache(kv_c_and_k_pe, self.kv_c_and_k_pe_cache, context.slot_mapping)
+
+        if rank == 0:
+            print(f"in decode forward, after update kvcache. self.kv_c_and_k_pe_cache={self.kv_c_and_k_pe_cache}")
 
         # Attention
         q = torch.cat([q_nope, q_pe], dim=-1)
@@ -853,7 +927,7 @@ class Z100_MLA(nn.Module):
                         safetensor_file,
                         original_weight_name,
                         layer_id,
-                        model.rank,
+                        rank,
                         already_loaded_set,
                     )
 
@@ -919,7 +993,7 @@ class Z100_MLA(nn.Module):
 
             if shard_dim != -1:
                 shard_size = weight.shape[shard_dim]
-                assert dequant_tensor.shape[1 - shard_dim] == shard_size * model.world_size
+                assert dequant_tensor.shape[1 - shard_dim] == shard_size * world_size
                 dequant_tensor = dequant_tensor.narrow(1 - shard_dim, shard_size * tp_rank, shard_size)
 
             weight.T.copy_(dequant_tensor)
@@ -1015,7 +1089,7 @@ class Z100_Block(nn.Module):
                             safetensor_file,
                             original_weight_name,
                             layer_id,
-                            model.rank,
+                            rank,
                             already_loaded_set,
                         )
                     elif weight_name_parts[0] == 'mlp':
@@ -1023,7 +1097,7 @@ class Z100_Block(nn.Module):
                             safetensor_file,
                             original_weight_name,
                             layer_id,
-                            model.rank,
+                            rank,
                             already_loaded_set,
                         )
                     else:
@@ -1111,8 +1185,12 @@ class DeepseekV3ForCausalLLM(nn.Module):
         return hidden_states
     
 
-    def load_weight(self, path: str = None, layer_id = None):
+    def load_weight(self, path: str = None, start_layer=0, end_layer=0):
         self.path = path
+
+        for idx, layer in enumerate(self.layers):
+            print(f"loading layer weights: {start_layer+idx}")
+            layer.load_weight(path, start_layer+idx)
 
         for file in sorted(glob(os.path.join(path, "*.safetensors"))):
             # print(f'Loading MLA weight from {file}')
@@ -1130,6 +1208,12 @@ class DeepseekV3ForCausalLLM(nn.Module):
                     weight_name = '.'.join(weight_name_parts)
                     assert weight_name_parts[0] in ['embed_tokens', 'lm_head', 'norm'], f'{original_weight_name=}'
 
+                    if start_layer != 0 and weight_name_parts[0] in ['embed_tokens']:
+                        continue
+
+                    if end_layer != 60 and weight_name_parts[0] in ['lm_head', 'norm']:
+                        continue
+
                     SHARD_ID_TO_SHARDED_DIM = {'embed_tokens': 0, 'lm_head': 0, 'norm': -1}
 
                     shard_id = weight_name_parts[0]
@@ -1145,8 +1229,8 @@ class DeepseekV3ForCausalLLM(nn.Module):
 
                     if shard_dim != -1:
                         shard_size = weight.shape[shard_dim]
-                        assert loaded_weight.shape[shard_dim] == shard_size * model.world_size
-                        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * model.rank, shard_size)
+                        assert loaded_weight.shape[shard_dim] == shard_size * world_size
+                        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * rank, shard_size)
 
                     weight.copy_(loaded_weight)
     
@@ -1162,6 +1246,8 @@ class DeepseekV3ForCausalLLMFirst(DeepseekV3ForCausalLLM):
         context = get_context()
 
         tokens = tokens.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can add a dim to walk around.
+
+        print(f"{time.time()}, DSV3 forward rank={rank}, DeepseekV3ForCausalLLMFirst tokens={tokens}, positions={positions}")
 
         seqlen = tokens.size(1)
         mask = None

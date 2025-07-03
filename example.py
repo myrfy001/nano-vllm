@@ -14,9 +14,9 @@ def main(node_id: int, node_num: int):
         time.sleep(100000)
         raise SystemExit
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=50)
     prompts = [
-        "introduce yourself",
+        "你是谁",
     ]
     prompts = [
         tokenizer.apply_chat_template(
@@ -27,6 +27,8 @@ def main(node_id: int, node_num: int):
         )
         for prompt in prompts
     ]
+
+    print(f"prompts={prompts}")
     outputs = llm.generate(prompts, sampling_params)
 
     for prompt, output in zip(prompts, outputs):
