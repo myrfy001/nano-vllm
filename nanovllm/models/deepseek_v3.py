@@ -1,15 +1,18 @@
+from  glob import glob
 import math
 from dataclasses import dataclass
+import os
 import time
-from typing import Tuple, Optional, Literal
+from typing import Set, Tuple, Optional, Literal
 
+from safetensors import safe_open
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch.cuda.nvtx as nvtx
 
-from nanovllm.layers.fused_moe import FusedMoE
+from nanovllm.layers.fused_moe import FusedMoE, awq_dequantize_triton
 from nanovllm.layers.kernel import act_quant, weight_dequant, fp8_gemm
 from nanovllm.utils.context import get_context
 from nanovllm.layers.attention import store_kvcache
@@ -92,6 +95,36 @@ attn_impl: Literal["naive", "absorb"] = "absorb"
 #     beta_slow: int = 1
 #     mscale: float = 1.
 
+def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor, tp_dim: int | None = None):
+    # print(f'{param.dtype=}, {loaded_weight.dtype=}')
+    param.data.copy_(loaded_weight)
+
+
+def get_param_from_model(root: nn.Module, name: str) -> nn.Parameter:
+    """
+    torch's get_parameter doesn't support ModuleList or ModuleDict
+    """
+    parts = name.split(".")
+    module = root
+    for part in parts[:-1]:
+        if isinstance(module, nn.ModuleList):
+            if len(module) > int(part):
+                module = module[int(part)]
+            else:
+                return None
+        elif isinstance(module, nn.ModuleDict):
+            if part in module:
+                module = module[part]
+            else:
+                return None
+        else:
+            module = getattr(module, part)
+    return getattr(module, parts[-1], None)
+
+
+def load_read_value_to_parameters(name: str, target_tensor: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor):
+    if qweight.dtype == torch.int32:
+        dequant_tensor = awq_dequantize_triton(qweight, scale, zero)
 
 class ParallelEmbedding(nn.Module):
     """
@@ -456,10 +489,13 @@ class Z100_MoE(nn.Module):
         self.dim = args.hidden_size
         assert args.n_routed_experts % nanovllm_config.tensor_parallel_size == 0, f"Number of experts must be divisible by world size (nanovllm_config.tensor_parallel_size={nanovllm_config.tensor_parallel_size})"
         self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // nanovllm_config.tensor_parallel_size
         self.n_activated_experts = args.num_experts_per_tok
-        self.experts_start_idx = nanovllm_config.local_rank * self.n_local_experts
+
+        # for fused MOE with TP, each card all experts' partial weight
+        self.n_local_experts = args.n_routed_experts
+        self.experts_start_idx = 0
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+
         self.gate = Linear(args.hidden_size, args.n_routed_experts, bias=True)
         self.experts = FusedMoE(
             num_experts=args.n_routed_experts,
@@ -494,6 +530,148 @@ class Z100_MoE(nn.Module):
         z = self.shared_experts(x)
         dist.all_reduce(y, group=get_tp_group())
         return (y + z).view(shape)
+    
+    def _load_w13(self, expert_data: torch.Tensor, shard_dim: int,
+                  shard_id: str, loaded_weight: torch.Tensor, tp_rank: int):
+        # Index the loaded weight for tp sharding.
+        # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
+        shard_size = expert_data.shape[shard_dim] // 2
+        loaded_weight = loaded_weight.narrow(1 - shard_dim, shard_size * tp_rank, shard_size)
+        # Narrow parameter and load.
+        # w1, gate_proj: Load into first logical weight of w13.
+        if shard_id == "w1":
+            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+        # w3, up_proj: Load into second logical weight of w13.
+        else:
+            assert shard_id == "w3"
+            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+        # print(f'{expert_data.shape=}, {loaded_weight.shape=}')
+        expert_data.T.copy_(loaded_weight)
+
+    def _load_w2(self,
+                 expert_data: torch.Tensor,
+                 shard_dim: int,
+                 loaded_weight: torch.Tensor,
+                 tp_rank: int):
+
+        # Index the loaded weight for tp sharding.
+        # down_proj: "RowParallel" so tp sharding on input_dim
+        # Narrow parameter and load.
+        shard_size = expert_data.shape[shard_dim]
+        loaded_weight = loaded_weight.narrow(1 - shard_dim,
+                                                shard_size * tp_rank,
+                                                shard_size)
+        # w2, down_proj: Load into only logical weight of w2.
+        # print(f'{expert_data.shape=}, {loaded_weight.shape=}')
+        expert_data.T.copy_(loaded_weight)
+
+    def load_weight(self, path: str, layer_id: int):
+        assert 3 <= layer_id < 61
+        packed_modules_mapping = getattr(self, "packed_modules_mapping", {})
+        already_loaded_set = set()
+
+        for file in sorted(glob(os.path.join(path, "*.safetensors"))):
+            # print(f'Loading MLA weight from {file}')
+            with safe_open(file, "pt", "cpu") as safetensor_file:
+                for weight_name in safetensor_file.keys():
+                    if not (".layers." in weight_name and ".mlp." in weight_name):
+                        continue
+                    layer = int(weight_name.split('.')[2])
+                    if layer != layer_id:
+                        continue
+                    self.load_from_safetensor(safetensor_file, weight_name, layer_id, model.rank, already_loaded_set)
+
+    def load_from_safetensor(
+        self,
+        safetensor_file,
+        original_weight_name: str,
+        layer_id: int,
+        tp_rank: int,
+        already_loaded_set: Set[str],
+    ):
+        # ['model', 'layers', '3', 'mlp', 'experts', '0', 'down_proj', 'qweight']
+        original_weight_name_parts = original_weight_name.split('.')
+
+        assert int(original_weight_name_parts[2]) == layer_id
+        assert original_weight_name_parts[3] == 'mlp'
+
+        load_dedup_key = '.'.join(original_weight_name_parts[:-1])
+        if load_dedup_key in already_loaded_set:
+            # print(f'Skip {original_weight_name=}')
+            return
+        # print(f'Load {original_weight_name=}')
+
+        # ['experts', '0', 'down_proj', 'qweight']
+        weight_name_parts = original_weight_name_parts[4:]
+        weight_name = '.'.join(weight_name_parts)
+        assert weight_name_parts[0] in ['gate', 'shared_experts', 'experts']
+
+        NAME_TO_SHARDED_ID = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+
+        if weight_name_parts[0] == 'experts':
+            expert_id = int(weight_name_parts[1])
+            assert 0 <= expert_id < 256
+
+            # currently map to same id
+            map_global_expert_id_to_local_expert_id = lambda id: id
+            expert_id = map_global_expert_id_to_local_expert_id(expert_id)
+
+            name = weight_name_parts[2]
+            shard_id = NAME_TO_SHARDED_ID[name]
+            shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+
+            if shard_id in ["w1", "w3"]:
+                w13_qweight = get_param_from_model(self, f"experts.w13_qweight")[expert_id]
+                w13_scales = get_param_from_model(self, f"experts.w13_scales")[expert_id]
+                w13_qzeros = get_param_from_model(self, f"experts.w13_qzeros")[expert_id]
+                if w13_qweight is None:
+                    print(f"Warning: Parameter layers.{layer_id}.ffn.experts.w13_qweight not found in model.")
+                    return
+                original_weight_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{name}.qweight"
+                loaded_tensor = safetensor_file.get_tensor(original_weight_name)
+                self._load_w13(w13_qweight, shard_dim, shard_id, loaded_tensor, tp_rank)
+
+                original_weight_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{name}.scales"
+                loaded_tensor = safetensor_file.get_tensor(original_weight_name)
+                self._load_w13(w13_scales, shard_dim, shard_id, loaded_tensor, tp_rank)
+
+                original_weight_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{name}.qzeros"
+                loaded_tensor = safetensor_file.get_tensor(original_weight_name)
+                self._load_w13(w13_qzeros, shard_dim, shard_id, loaded_tensor, tp_rank)
+            else:
+                assert shard_id == 'w2'
+
+                w2_qweight = get_param_from_model(self, f"experts.w2_qweight")[expert_id]
+                w2_scales = get_param_from_model(self, f"experts.w2_scales")[expert_id]
+                w2_qzeros = get_param_from_model(self, f"experts.w2_qzeros")[expert_id]
+                original_weight_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{name}.qweight"
+                loaded_tensor = safetensor_file.get_tensor(original_weight_name)
+                self._load_w2(w2_qweight, shard_dim, loaded_tensor, tp_rank)
+
+                original_weight_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{name}.scales"
+                loaded_tensor = safetensor_file.get_tensor(original_weight_name)
+                self._load_w2(w2_scales, shard_dim, loaded_tensor, tp_rank)
+
+                original_weight_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{name}.qzeros"
+                loaded_tensor = safetensor_file.get_tensor(original_weight_name)
+                self._load_w2(w2_qzeros, shard_dim, loaded_tensor, tp_rank)
+            already_loaded_set.add(load_dedup_key)
+        elif weight_name_parts[0] == 'shared_experts':
+            self.shared_experts.load_from_safetensor(
+                safetensor_file,
+                original_weight_name,
+                layer_id,
+                tp_rank,
+                already_loaded_set,
+            )
+        elif weight_name_parts[0] == 'gate':
+            param = get_param_from_model(self, weight_name)
+            if param is not None:
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, safetensor_file.get_tensor(original_weight_name), None)
+            else:
+                raise Exception(f"Warning: Parameter {weight_name} not found in model.")
 
 
 class Z100_MLA(nn.Module):
@@ -653,6 +831,108 @@ class Z100_MLA(nn.Module):
         )
 
         return self._v_up_proj_and_o_proj(o)
+    
+    def load_weight(self, path, layer_id):
+        packed_modules_mapping = getattr(self, "packed_modules_mapping", {})
+        already_loaded_set = set()
+
+        for file in sorted(glob(os.path.join(path, "*.safetensors"))):
+            # print(f'Loading MLA weight from {file}')
+            with safe_open(file, "pt", "cpu") as safetensor_file:
+                for original_weight_name in safetensor_file.keys():
+                    original_weight_name_parts = original_weight_name.split(".")
+
+                    # MLA layer
+                    if not 'self_attn' in original_weight_name:
+                        continue
+                    cur_layer_id = int(original_weight_name_parts[2])
+                    if cur_layer_id != layer_id:
+                        continue
+
+                    self.load_from_safetensor(
+                        safetensor_file,
+                        original_weight_name,
+                        layer_id,
+                        model.rank,
+                        already_loaded_set,
+                    )
+
+    def load_from_safetensor(
+        self,
+        safetensor_file,
+        original_weight_name: str,
+        layer_id: int,
+        tp_rank: int,
+        already_loaded_set: Set[str],
+    ):
+        # ['model', 'layers', '1', 'self_attn', 'kv_b_proj', 'qweight']
+        # ['model', 'layers', '1', 'self_attn', 'kv_a_proj_with_mqa', 'weight']
+        original_weight_name_parts = original_weight_name.split('.')
+
+        assert original_weight_name_parts[3] == 'self_attn'
+        assert int(original_weight_name_parts[2]) == layer_id
+
+        load_dedup_key = '.'.join(original_weight_name_parts[:-1])
+        if load_dedup_key in already_loaded_set:
+            return
+
+        # ['kv_b_proj', 'qweight']
+        # ['kv_a_proj_with_mqa', 'weight']
+        weight_name_parts = original_weight_name_parts[4:]
+        weight_name = '.'.join(weight_name_parts)
+        assert weight_name_parts[0] in [
+            'q_a_proj',
+            'q_a_layernorm',
+            'q_b_proj',
+            'kv_a_proj_with_mqa',
+            'kv_a_layernorm',
+            'kv_b_proj',
+            'o_proj',
+        ]
+
+        original_qweight_name = ".".join(original_weight_name_parts[:-1] + ["qweight"])
+        original_scale_name = ".".join(original_weight_name_parts[:-1] + ["scales"])
+        original_zero_name = ".".join(original_weight_name_parts[:-1] + ["qzeros"])
+        is_quantized = original_qweight_name in safetensor_file.keys() and \
+                    original_scale_name in safetensor_file.keys() and \
+                    original_zero_name in safetensor_file.keys()
+
+        if is_quantized:
+            assert weight_name_parts[0] in ['q_a_proj', 'q_b_proj', 'kv_b_proj', 'o_proj']
+            loaded_tensor_weight = safetensor_file.get_tensor(original_qweight_name)
+            loaded_tensor_scale = safetensor_file.get_tensor(original_scale_name)
+            loaded_tensor_zero = safetensor_file.get_tensor(original_zero_name)
+
+            dequant_tensor = awq_dequantize_triton(loaded_tensor_weight, loaded_tensor_scale, loaded_tensor_zero)
+
+            SHARD_ID_TO_SHARDED_DIM = {'q_a_proj': -1, 'q_b_proj': 0, 'kv_b_proj': 0, 'o_proj': 1}
+
+            shard_id = weight_name_parts[0]
+            shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+
+            param_path = f'{shard_id}.weight'
+            # print(f"{param_path=}, {weight_name=}, {original_weight_name=}, {dequant_tensor.shape=}")
+            weight = get_param_from_model(self, param_path)
+            if weight is None:
+                print(f"Warning: Parameter {param_path} not found in model.")
+                return
+
+            if shard_dim != -1:
+                shard_size = weight.shape[shard_dim]
+                assert dequant_tensor.shape[1 - shard_dim] == shard_size * model.world_size
+                dequant_tensor = dequant_tensor.narrow(1 - shard_dim, shard_size * tp_rank, shard_size)
+
+            weight.T.copy_(dequant_tensor)
+        else:
+            assert weight_name_parts[0] in ['q_a_layernorm', 'kv_a_proj_with_mqa', 'kv_a_layernorm']
+            param = get_param_from_model(self, weight_name)
+            if param is not None:
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, safetensor_file.get_tensor(original_weight_name), None)
+            else:
+                raise Exception(f"Warning: Parameter {weight_name} not found in model.")
+
+        already_loaded_set.add(load_dedup_key)
 
 
 class Z100_Block(nn.Module):
@@ -676,10 +956,10 @@ class Z100_Block(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.args = args
-        self.attn = Z100_MLA(args, nanovllm_config)
-        self.ffn = MLP(args.hidden_size, args.intermediate_size) if layer_id < args.first_k_dense_replace else Z100_MoE(args, nanovllm_config)
-        self.attn_norm = RMSNorm(args.hidden_size)
-        self.ffn_norm = RMSNorm(args.hidden_size)
+        self.self_attn = Z100_MLA(args, nanovllm_config)
+        self.mlp = MLP(args.hidden_size, args.intermediate_size) if layer_id < args.first_k_dense_replace else Z100_MoE(args, nanovllm_config)
+        self.input_layernorm = RMSNorm(args.hidden_size)
+        self.post_attention_layernorm = RMSNorm(args.hidden_size)
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -699,9 +979,61 @@ class Z100_Block(nn.Module):
         if context.is_prefill:
             return x
         else:
-            x = x + self.attn(self.attn_norm(x), positions, freqs_cis, mask)
-            x = x + self.ffn(self.ffn_norm(x))
+            x = x + self.self_attn(self.input_layernorm(x * 0.2), positions, freqs_cis, mask)
+            x = x + self.mlp(self.post_attention_layernorm(x * 0.2))
         return x
+    
+
+    def load_weight(self, path: str, layer_id: int):
+        assert 0 <= layer_id < 61
+        already_loaded_set = set()
+
+        for file in sorted(glob(os.path.join(path, "*.safetensors"))):
+            # print(f'Loading MLA weight from {file}')
+            with safe_open(file, "pt", "cpu") as safetensor_file:
+                for original_weight_name in safetensor_file.keys():
+                    # ['model', 'layers', '6', 'self_attn', 'kv_b_proj', 'qweight']
+                    # ['model', 'layers', '6', 'mlp', 'experts', '0', 'down_proj', 'qweight']
+                    original_weight_name_parts = original_weight_name.split(".")
+
+                    # layer
+                    if not "layers" in original_weight_name_parts:
+                        continue
+
+                    cur_layer_id = int(original_weight_name_parts[2])
+                    if cur_layer_id != layer_id:
+                        continue
+
+                    # ['self_attn', 'kv_b_proj', 'qweight']
+                    # ['mlp', 'experts', '0', 'down_proj', 'qweight']
+                    weight_name_parts = original_weight_name_parts[3:]
+                    weight_name = '.'.join(weight_name_parts)
+                    assert weight_name_parts[0] in ['input_layernorm', 'self_attn', 'post_attention_layernorm', 'mlp']
+
+                    if weight_name_parts[0] == 'self_attn':
+                        self.self_attn.load_from_safetensor(
+                            safetensor_file,
+                            original_weight_name,
+                            layer_id,
+                            model.rank,
+                            already_loaded_set,
+                        )
+                    elif weight_name_parts[0] == 'mlp':
+                        self.mlp.load_from_safetensor(
+                            safetensor_file,
+                            original_weight_name,
+                            layer_id,
+                            model.rank,
+                            already_loaded_set,
+                        )
+                    else:
+                        assert weight_name_parts[0] in ['input_layernorm', 'post_attention_layernorm']
+                        param = get_param_from_model(self, weight_name)
+                        if param is not None:
+                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                            weight_loader(param, safetensor_file.get_tensor(original_weight_name), None)
+                        else:
+                            raise Exception(f"Warning: Parameter {weight_name} not found in model.")
 
 
 class DeepseekV3ForCausalLLM(nn.Module):
@@ -716,27 +1048,6 @@ class DeepseekV3ForCausalLLM(nn.Module):
         head (nn.Module): Output projection layer mapping to vocabulary size.
         freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
     """
-
-    packed_modules_mapping = {
-        "embed_tokens": ("embed", 0),
-        "input_layernorm": ("attn_norm", None),
-        "post_attention_layernorm": ("ffn_norm", None),
-        "q_proj": ("wq", 1),
-        "q_a_proj": ("wq_a", None),
-        "q_a_layernorm": ("q_norm", None),
-        "q_b_proj": ("wq_b", 1),
-        "kv_a_proj_with_mqa": ("wkv_a", None),
-        "kv_a_layernorm": ("kv_norm", None),
-        "kv_b_proj": ("wkv_b", 1),
-        "o_proj": ("wo", 0),
-        "gate": ("gate", None),
-        "gate_proj": ("w1", 1),
-        "down_proj": ("w2", 0),
-        "up_proj": ("w3", 1),
-        "norm": ("norm", None),
-        "lm_head": ("head", 0),  # note: lm_head is not like quanted params, it's not transposed in file, so use 0 dim to split here 
-        "scale": ("scale", None),
-    }
 
     def __init__(self, args, nanovllm_config):
         """
@@ -800,10 +1111,50 @@ class DeepseekV3ForCausalLLM(nn.Module):
         return hidden_states
     
 
+    def load_weight(self, path: str = None, layer_id = None):
+        self.path = path
+
+        for file in sorted(glob(os.path.join(path, "*.safetensors"))):
+            # print(f'Loading MLA weight from {file}')
+            with safe_open(file, "pt", "cpu") as safetensor_file:
+                for original_weight_name in safetensor_file.keys():
+                    # ['model', 'embed_tokens', 'weight']
+                    # ['model', 'lm_head', 'weight']
+                    original_weight_name_parts = original_weight_name.split(".")
+
+                    # Do not handle layer here
+                    if "layers" in original_weight_name_parts:
+                        continue
+
+                    weight_name_parts = original_weight_name_parts[-2:]
+                    weight_name = '.'.join(weight_name_parts)
+                    assert weight_name_parts[0] in ['embed_tokens', 'lm_head', 'norm'], f'{original_weight_name=}'
+
+                    SHARD_ID_TO_SHARDED_DIM = {'embed_tokens': 0, 'lm_head': 0, 'norm': -1}
+
+                    shard_id = weight_name_parts[0]
+                    shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+
+                    weight = get_param_from_model(self, weight_name)
+                    if weight is None:
+                        print(f"Warning: Parameter {weight_name} not found in model.")
+                        return
+
+                    loaded_weight = safetensor_file.get_tensor(original_weight_name)
+                    # print(f'{loaded_weight.shape=}')
+
+                    if shard_dim != -1:
+                        shard_size = weight.shape[shard_dim]
+                        assert loaded_weight.shape[shard_dim] == shard_size * model.world_size
+                        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * model.rank, shard_size)
+
+                    weight.copy_(loaded_weight)
+    
+
 class DeepseekV3ForCausalLLMFirst(DeepseekV3ForCausalLLM):
     def __init__(self, args, nanovllm_config):
         super().__init__(args, nanovllm_config)
-        self.embed = ParallelEmbedding(args.vocab_size, args.hidden_size)
+        self.embed_tokens = ParallelEmbedding(args.vocab_size, args.hidden_size)
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, positions: torch.Tensor):
@@ -818,7 +1169,7 @@ class DeepseekV3ForCausalLLMFirst(DeepseekV3ForCausalLLM):
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
         freqs_cis = self.freqs_cis[positions]
 
-        h = self.embed(tokens)
+        h = self.embed_tokens(tokens)
 
         for layer in self.layers:
             h = layer(h, positions, freqs_cis, mask)
@@ -858,7 +1209,7 @@ class DeepseekV3ForCausalLLMLast(DeepseekV3ForCausalLLM):
     def __init__(self, args, nanovllm_config):
         super().__init__(args, nanovllm_config)
         self.norm = RMSNorm(args.hidden_size)
-        self.head = ColumnParallelLinear(args.hidden_size, args.vocab_size, dtype=torch.get_default_dtype())
+        self.lm_head = ColumnParallelLinear(args.hidden_size, args.vocab_size, dtype=torch.get_default_dtype())
 
     @torch.inference_mode()
     def forward(self, h: torch.Tensor, positions: torch.Tensor):
@@ -871,17 +1222,20 @@ class DeepseekV3ForCausalLLMLast(DeepseekV3ForCausalLLM):
             mask = torch.full((seqlen, seqlen), float("-inf"), device=h.device).triu_(1)
 
         freqs_cis = self.freqs_cis[positions]
+        
+        print(f"{time.time()}, rank={get_tp_rank()}, DeepseekV3ForCausalLLMLast's forward before layers", flush=True)
+
         for layer in self.layers:
             h = layer(h, positions, freqs_cis, mask)
 
-        # print(f"{time.time()}, rank={get_tp_rank()}, DeepseekV3ForCausalLLMLast's forward before norm, h={h}")
+        print(f"{time.time()}, rank={get_tp_rank()}, DeepseekV3ForCausalLLMLast's forward before norm", flush=True)
 
         h = self.norm(h)
 
         if context.is_prefill:
-            logits = torch.randn(list(h.shape[:-1]) + [self.args.vocab_size], device=h.device, dtype=h.dtype)
+            logits = torch.randn(list(h.shape[:-1]) + [self.args.vocab_size // world_size], device=h.device, dtype=h.dtype)
         else:
-            logits = self.head(h)
+            logits = self.lm_head(h)
 
         all_logits = [torch.empty_like(logits) for _ in range(world_size)]
         dist.all_gather(all_logits, logits, group=get_tp_group())

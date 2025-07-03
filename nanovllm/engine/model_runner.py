@@ -91,12 +91,13 @@ class ModelRunner:
 
         
         # load_model(self.model, config.model, tp_size=config.tensor_parallel_size, local_rank=tp_rank, start_layer=pp_start_layer_id, end_layer=pp_end_layer_id)
+        self.model.load_weight(config.model)
         self.pp_node_type = pp_node_type
 
 
-        print(f"{time.time()}, rank{self.tp_rank}, in ModelRunner __init__ before global barrier", flush=True)
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in ModelRunner __init__ before global barrier", flush=True)
         dist.barrier()
-        print(f"{time.time()}, rank{self.tp_rank}, in ModelRunner __init__ after global barrier", flush=True)
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in ModelRunner __init__ after global barrier", flush=True)
 
         # import pdb; pdb.set_trace()
 
@@ -139,7 +140,7 @@ class ModelRunner:
 
 
     def loop(self):
-        if False:
+        if True:
             prof_early_break_counter = 0
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -198,13 +199,13 @@ class ModelRunner:
                     context.is_prefill, context.slot_mapping, context.context_lens, context.block_tables, hidden_state, positions, self.buf_tensor
                 )
 
-            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
             torch.cuda.synchronize()
             dist.send(self.buf_tensor, self.next_pp_head_node_global_rank)
             torch.cuda.synchronize()
         else:
             # for last node, send logits instead of hidden state
-            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} logits", flush=True)
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={hidden_state.size()}, dtype={hidden_state.dtype} logits", flush=True)
             torch.cuda.synchronize()
             dist.send(hidden_state, self.next_pp_head_node_global_rank)
             torch.cuda.synchronize()
@@ -213,12 +214,12 @@ class ModelRunner:
         assert self.tp_rank == 0
 
         if self.pp_node_type != PPNodeType.PPNodeFirst:
-            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
             dist.recv(self.buf_tensor, self.prev_pp_head_node_global_rank)
             torch.cuda.synchronize()
         else:
             assert logit_tensor is not None
-            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={logit_tensor.size()}, dtype={logit_tensor.dtype} logit_tensor", flush=True)
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.recv size={logit_tensor.size()}, dtype={logit_tensor.dtype} logit_tensor", flush=True)
             dist.recv(logit_tensor, self.prev_pp_head_node_global_rank)
             torch.cuda.synchronize()
             
@@ -244,9 +245,28 @@ class ModelRunner:
         for mp_queue in self.mp_queue:
             mp_queue.put((method_name, args))
 
+    
+
     def call(self, method_name, *args):
         if self.tp_world_size > 1 and self.tp_rank == 0:
-            self.write_shm(method_name, *args)
+            if method_name == "run":
+                self.write_shm(method_name, *args)
+            elif method_name == "run_non_first_node":
+                self.write_shm(method_name)
+                print(f"{time.time()}, rank{self.tp_rank},{self.rank}, send serialized data by broadcast, src={self.rank}", flush=True)
+                dist.broadcast(self.buf_tensor, src=self.rank, group=self.tp_group)
+                print(f"{time.time()}, rank{self.tp_rank},{self.rank}, finish send serialized data by broadcast, src={self.rank}", flush=True)
+            else:
+                raise Exception("Not supported function call")
+            
+        if self.tp_rank > 0:
+            if method_name == "run_non_first_node":
+                # recv serialized data
+                print(f"{time.time()}, rank{self.tp_rank},{self.rank}, recv serialized data by broadcast, src={self.rank-self.tp_rank}", flush=True)
+                dist.broadcast(self.buf_tensor, src=self.rank-self.tp_rank, group=self.tp_group)
+                print(f"{time.time()}, rank{self.tp_rank},{self.rank}, after recv serialized data by broadcast, src={self.rank-self.tp_rank}", flush=True)
+                args = (self.buf_tensor,)
+
         method = getattr(self, method_name, None)
         assert callable(method)
         return method(*args)
@@ -344,7 +364,7 @@ class ModelRunner:
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         
-        # print(f"{time.time()}, rank{self.tp_rank}, in prepare_decode(), before create tensor input_ids={input_ids}, positions={positions}, slot_mapping={slot_mapping}, context_lens={context_lens}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), before create tensor input_ids={input_ids}, positions={positions}, slot_mapping={slot_mapping}, context_lens={context_lens}")
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(device=self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(device=self.device, non_blocking=True)
@@ -352,11 +372,11 @@ class ModelRunner:
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(device=self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
 
-        # print(f"{time.time()}, rank{self.tp_rank}, in prepare_decode(), after create tensor input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), after create tensor input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
 
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
 
-        # print(f"{time.time()}, rank{self.tp_rank}, in prepare_decode(), before return input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), before return input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -368,11 +388,11 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_tensor: torch.Tensor, positions: torch.Tensor, is_prefill):
-        # print(f"{time.time()}, rank{self.tp_rank}, in run_model() begin, is_prefill={is_prefill}, self.enforce_eager={self.enforce_eager}, nput_tensor.size={input_tensor.size()}")
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() begin, is_prefill={is_prefill}, self.enforce_eager={self.enforce_eager}, nput_tensor.size={input_tensor.size()}", flush=True)
         if is_prefill or self.enforce_eager or input_tensor.size(0) > 512:
-            # print(f"{time.time()}, rank{self.tp_rank}, in run_model() before model run, input_tensor={input_tensor}, {input_tensor.size()}, positions={positions}, {positions.size()}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model run, input_tensor={input_tensor}, {input_tensor.size()}, positions={positions}, {positions.size()}")
             hidden_state = self.model(input_tensor, positions)
-            # print(f"{time.time()}, rank{self.tp_rank}, in run_model() after model run, hidden_state={hidden_state}, {hidden_state.size()}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() after model run, hidden_state={hidden_state}, {hidden_state.size()}")
 
             if self.pp_node_type == PPNodeType.PPNodeLast:
                 logits = self.model.compute_logits(hidden_state)
@@ -381,7 +401,7 @@ class ModelRunner:
                 hidden_state = hidden_state.squeeze(0)
                 return hidden_state
         else:
-            # print(f"{time.time()}, rank{self.tp_rank}, in run_model(), cuda-graph run path enter")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model(), cuda-graph run path enter")
             bs = 1 # TODO: FIXME 
             # bs = input_tensor.size(0)
             # context = get_context()
@@ -392,7 +412,7 @@ class ModelRunner:
             #         v.zero_()
 
             # print(
-            #     f"{time.time()}, rank{self.tp_rank}, in run_model(), cuda-graph run path enter",
+            #     f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_model(), cuda-graph run path enter",
             #     f'input_tensor: {graph_vars["input_tensor"].size()}, {input_tensor.size()}, '
             #     f'positions: {graph_vars["positions"].size()}, {positions.size()}, '
             #     f'slot_mapping: {graph_vars["slot_mapping"].size()}, {context.slot_mapping.size()}, '
@@ -406,10 +426,10 @@ class ModelRunner:
             # graph_vars["context_lens"][:bs] = context.context_lens
             # graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
 
-            # print(f'{time.time()}, rank{self.tp_rank}, in run_model() before model replay')
+            print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model replay', flush=True)
             graph.replay()
             torch.cuda.synchronize()
-            # print(f'{time.time()}, rank{self.tp_rank}, in run_model() after model replay')
+            print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() after model replay', flush=True)
 
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -418,43 +438,43 @@ class ModelRunner:
         
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
 
-        # print(f"{time.time()}, rank{self.tp_rank}, in run(), positions={positions}, {positions.device}, is_prefill={is_prefill}, input_ids={input_ids}")
-        # print(f"{time.time()}, rank{self.tp_rank}, in run(), positions size={positions.size()}, input_ids size={input_ids.size()}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), positions={positions}, {positions.device}, is_prefill={is_prefill}, input_ids={input_ids}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), positions size={positions.size()}, input_ids size={input_ids.size()}")
 
 
         hidden_state = self.run_model(input_ids, positions, is_prefill)
-        # print(f"{time.time()}, rank{self.tp_rank}, in run(), after run_model()")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), after run_model()")
 
         token_ids = None
         if self.tp_rank == 0:
             context = get_context()
-            # print(f"{time.time()}, rank{self.tp_rank}, in run(), before send_pp_cmd(), context={context}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), before send_pp_cmd(), context={context}")
             
             self.send_pp_cmd(context, hidden_state, positions)
-            # print(f"{time.time()}, rank{self.tp_rank}, in run(), after send_pp_cmd()")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), after send_pp_cmd()")
 
             temperatures = self.prepare_sample(seqs) if self.tp_rank == 0 else None
             logits = torch.empty([input_ids.size()[0], self.config.hf_config.vocab_size], dtype=torch.float16).cuda()
 
-            # print(f"{time.time()}, rank{self.tp_rank}, in run(), before recv_pp_cmd()")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), before recv_pp_cmd()")
             self.recv_pp_cmd(logits)
 
             assert logits.dim() == 2
 
 
-            # print(f"{time.time()}, rank{self.tp_rank}, in run(), after recv_pp_cmd(), logits={logits}, {logits.size()}, temperatures={temperatures}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), after recv_pp_cmd(), logits={logits}, {logits.size()}, temperatures={temperatures}")
             token_ids = self.sampler(logits, temperatures).tolist() if self.tp_rank == 0 else None
-            # print(f"{time.time()}, rank{self.tp_rank}, in run(), after sampler, token_ids={token_ids}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), after sampler, token_ids={token_ids}")
         reset_context()
 
-        # print(f"{time.time()}, rank{self.tp_rank}, in run(), before return, token_ids={token_ids}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), before return, token_ids={token_ids}")
         return token_ids
     
 
     def run_non_first_node(self, buf_tensor: torch.Tensor) -> list[int]:
         assert self.pp_node_type != PPNodeType.PPNodeFirst
         
-        # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), enter hidden_state={hidden_state}, positions={positions}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), enter hidden_state={hidden_state}, positions={positions}")
         local_buf_tensor = buf_tensor.to(self.device, non_blocking=True)
 
 
@@ -472,7 +492,7 @@ class ModelRunner:
         torch.cuda.synchronize()
         local_meta_buf_slice = self.meta_buf[0:6].tolist()
         
-        # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), local_meta_buf_slice={local_meta_buf_slice}", flush=True)
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), local_meta_buf_slice={local_meta_buf_slice}", flush=True)
         is_prefill = bool(int(local_meta_buf_slice[0]))
         slot_mapping_size = local_meta_buf_slice[1]
         context_lens_size = local_meta_buf_slice[2]
@@ -500,14 +520,14 @@ class ModelRunner:
         )
 
 
-        # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), before run_model()")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before run_model()")
         hidden_state = self.run_model(hidden_state, positions, is_prefill)
-        # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), after run_model()")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), after run_model()")
 
         if self.tp_rank == 0:
-            # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), before send_pp_cmd() hidden_state={hidden_state}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before send_pp_cmd() hidden_state={hidden_state}")
             self.send_pp_cmd(get_context(), hidden_state, positions)
-            # print(f"{time.time()}, rank{self.tp_rank}, in run_non_first_node(), after send_pp_cmd()")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), after send_pp_cmd()")
 
         
     
