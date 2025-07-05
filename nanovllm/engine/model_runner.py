@@ -67,6 +67,7 @@ class ModelRunner:
         
 
         pp_start_layer_id, pp_end_layer_id, pp_node_type = config.pp_schema
+        pp_end_layer_id -= 1
         self.pp_start_layer_id = pp_start_layer_id
 
 
