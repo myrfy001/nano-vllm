@@ -618,17 +618,17 @@ class Z100_MoE(nn.Module):
 
         
 
-        if rank == 0 or rank == 3:
-            print(f"{self.routed_scaling_factor=}")
-            save_file({"x":x}, f"dumps/{time.time()}_rank{rank}-z100_moe_x.safetensor")
-            save_file({"y":y}, f"dumps/{time.time()}_rank{rank}-z100_moe_y_before_allreduce.safetensor")
-            save_file({"z":z}, f"dumps/{time.time()}_rank{rank}-z100_moe_z.safetensor")
-            save_file({"weights":weights}, f"dumps/{time.time()}_rank{rank}-z100_moe_weights.safetensor")
+        # if rank == 0 or rank == 3:
+        #     print(f"{self.routed_scaling_factor=}")
+        #     save_file({"x":x}, f"dumps/{time.time()}_rank{rank}-z100_moe_x.safetensor")
+        #     save_file({"y":y}, f"dumps/{time.time()}_rank{rank}-z100_moe_y_before_allreduce.safetensor")
+        #     save_file({"z":z}, f"dumps/{time.time()}_rank{rank}-z100_moe_z.safetensor")
+        #     save_file({"weights":weights}, f"dumps/{time.time()}_rank{rank}-z100_moe_weights.safetensor")
 
         dist.all_reduce(y, group=get_tp_group())
 
-        if rank == 0 or rank == 3:
-            save_file({"y":y}, f"dumps/{time.time()}_rank{rank}-z100_moe_y_after_allreduce.safetensor")
+        # if rank == 0 or rank == 3:
+        #     save_file({"y":y}, f"dumps/{time.time()}_rank{rank}-z100_moe_y_after_allreduce.safetensor")
 
         return (y + z).view(shape)
     
@@ -885,9 +885,9 @@ class Z100_MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        if rank == 0 or rank == 3:
-            # print(f"MLA input x = {x}", flush=True)
-            save_file({"x":x}, f"dumps/{time.time()}_rank{rank}-mla_input_x.safetensor")
+        # if rank == 0 or rank == 3:
+        #     # print(f"MLA input x = {x}", flush=True)
+        #     save_file({"x":x}, f"dumps/{time.time()}_rank{rank}-mla_input_x.safetensor")
 
         bsz, seqlen, _ = x.size()
         # x = x.squeeze(0) # [1x7168]
@@ -896,10 +896,10 @@ class Z100_MLA(nn.Module):
         ckq = self.q_a_proj(x) # [1x1536]
         kv = self.kv_a_proj_with_mqa(x) # [1x576]
 
-        if rank == 0 or rank == 3:
-            # print(f"MLA ckq= {ckq}, kv={kv}", flush=True)
-            save_file({"ckq":ckq}, f"dumps/{time.time()}_rank{rank}-mla_ckq.safetensor")
-            save_file({"kv":kv}, f"dumps/{time.time()}_rank{rank}-mla_kv.safetensor")
+        # if rank == 0 or rank == 3:
+        #     # print(f"MLA ckq= {ckq}, kv={kv}", flush=True)
+        #     save_file({"ckq":ckq}, f"dumps/{time.time()}_rank{rank}-mla_ckq.safetensor")
+        #     save_file({"kv":kv}, f"dumps/{time.time()}_rank{rank}-mla_kv.safetensor")
         kv_c, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
         # Normalize Q and KV
@@ -914,13 +914,13 @@ class Z100_MLA(nn.Module):
         # if rank == 0:
         #     print(f"freqs_cis = {freqs_cis}")
 
-        if rank == 0 or rank == 3:
-            save_file({"k_pe":k_pe}, f"dumps/{time.time()}_rank{rank}-mla_k_pe_before_rope.safetensor")
+        # if rank == 0 or rank == 3:
+        #     save_file({"k_pe":k_pe}, f"dumps/{time.time()}_rank{rank}-mla_k_pe_before_rope.safetensor")
 
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-        if rank == 0 or rank == 3:
-            save_file({"k_pe":k_pe}, f"dumps/{time.time()}_rank{rank}-mla_k_pe_after_rope.safetensor")
-            save_file({"kv_c_normed":kv_c_normed}, f"dumps/{time.time()}_rank{rank}-mla_kv_c_normed.safetensor")
+        # if rank == 0 or rank == 3:
+        #     save_file({"k_pe":k_pe}, f"dumps/{time.time()}_rank{rank}-mla_k_pe_after_rope.safetensor")
+        #     save_file({"kv_c_normed":kv_c_normed}, f"dumps/{time.time()}_rank{rank}-mla_kv_c_normed.safetensor")
 
         # print(f'MLA: {q_nope=}, {q_pe=}')
         # update kvcache
@@ -929,12 +929,12 @@ class Z100_MLA(nn.Module):
         assert self.page_size == 1
 
         context = get_context()
-        if rank == 0 or rank == 3:
-            # print(f"in decode forward, before update kvcache. self.kv_c_and_k_pe_cache={self.kv_c_and_k_pe_cache}")
-            # print(f"in decode forward, before update kvcache. context.slot_mapping={context.slot_mapping}")
-            # print(f"MLA kv_c_and_k_pe = {kv_c_and_k_pe}", flush=True)
-            save_file({"kv_c_and_k_pe":kv_c_and_k_pe}, f"dumps/{time.time()}_rank{rank}-mla_kv_c_and_k_pe.safetensor")
-            save_file({"positions":positions}, f"dumps/{time.time()}_rank{rank}-mla_positions.safetensor")
+        # if rank == 0 or rank == 3:
+        #     # print(f"in decode forward, before update kvcache. self.kv_c_and_k_pe_cache={self.kv_c_and_k_pe_cache}")
+        #     # print(f"in decode forward, before update kvcache. context.slot_mapping={context.slot_mapping}")
+        #     # print(f"MLA kv_c_and_k_pe = {kv_c_and_k_pe}", flush=True)
+        #     save_file({"kv_c_and_k_pe":kv_c_and_k_pe}, f"dumps/{time.time()}_rank{rank}-mla_kv_c_and_k_pe.safetensor")
+        #     save_file({"positions":positions}, f"dumps/{time.time()}_rank{rank}-mla_positions.safetensor")
             
         
 
@@ -955,14 +955,14 @@ class Z100_MLA(nn.Module):
             'SPLIT_K': 8,
         }
 
-        if rank == 0 or rank == 3:
-            # print(f"MLA q = {q}, req_to_tokens={context.block_tables}, b_seq_len={context.context_lens}", flush=True)
+        # if rank == 0 or rank == 3:
+        #     # print(f"MLA q = {q}, req_to_tokens={context.block_tables}, b_seq_len={context.context_lens}", flush=True)
 
-            save_file({"q":q}, f"dumps/{time.time()}_rank{rank}-mla_q.safetensor")
-            save_file({"kv_c_and_k_pe_cache":kv_c_and_k_pe_cache}, f"dumps/{time.time()}_rank{rank}-mla_kv_c_and_k_pe_cache.safetensor")
-            save_file({"kv_c_cache":kv_c_cache.contiguous()}, f"dumps/{time.time()}_rank{rank}-mla_kv_c_cache.safetensor")
-            save_file({"req_to_tokens":context.block_tables}, f"dumps/{time.time()}_rank{rank}-mla_req_to_tokens.safetensor")
-            save_file({"b_seq_len":context.context_lens}, f"dumps/{time.time()}_rank{rank}-mla_b_seq_len.safetensor")
+        #     save_file({"q":q}, f"dumps/{time.time()}_rank{rank}-mla_q.safetensor")
+        #     save_file({"kv_c_and_k_pe_cache":kv_c_and_k_pe_cache}, f"dumps/{time.time()}_rank{rank}-mla_kv_c_and_k_pe_cache.safetensor")
+        #     save_file({"kv_c_cache":kv_c_cache.contiguous()}, f"dumps/{time.time()}_rank{rank}-mla_kv_c_cache.safetensor")
+        #     save_file({"req_to_tokens":context.block_tables}, f"dumps/{time.time()}_rank{rank}-mla_req_to_tokens.safetensor")
+        #     save_file({"b_seq_len":context.context_lens}, f"dumps/{time.time()}_rank{rank}-mla_b_seq_len.safetensor")
 
         mla_decode(
             q,
@@ -975,9 +975,9 @@ class Z100_MLA(nn.Module):
             config=config,
         )
 
-        if rank == 0 or rank == 3:
-            # print(f"MLA o = {o}, sm_scale={self.softmax_scale}", flush=True)
-            save_file({"o":o}, f"dumps/{time.time()}_rank{rank}-mla_o.safetensor")
+        # if rank == 0 or rank == 3:
+        #     # print(f"MLA o = {o}, sm_scale={self.softmax_scale}", flush=True)
+        #     save_file({"o":o}, f"dumps/{time.time()}_rank{rank}-mla_o.safetensor")
 
         return self._v_up_proj_and_o_proj(o)
     
@@ -1129,11 +1129,11 @@ class Z100_Block(nn.Module):
             return x
         else:
             x = x + self.self_attn(self.input_layernorm(x * 0.2), positions, freqs_cis, mask)
-            if rank == 0 or rank == 3:
-                save_file({"x":x}, f"dumps/{time.time()}_rank{rank}-z100_block_middle_x.safetensor")
+            # if rank == 0 or rank == 3:
+            #     save_file({"x":x}, f"dumps/{time.time()}_rank{rank}-z100_block_middle_x.safetensor")
             x = x + self.mlp(self.post_attention_layernorm(x * 0.2))
-            if rank == 0 or rank == 3:
-                save_file({"x":x}, f"dumps/{time.time()}_rank{rank}-z100_block_final_x.safetensor")
+            # if rank == 0 or rank == 3:
+            #     save_file({"x":x}, f"dumps/{time.time()}_rank{rank}-z100_block_final_x.safetensor")
         return x
     
 
@@ -1296,7 +1296,6 @@ class DeepseekV3ForCausalLLM(nn.Module):
                     if start_layer != 0 and weight_name_parts[0] in ['embed_tokens']:
                         continue
                     
-                    print(f"{end_layer=}")
                     if end_layer != 60 and weight_name_parts[0] in ['lm_head', 'norm']:
                         continue
 
@@ -1333,7 +1332,7 @@ class DeepseekV3ForCausalLLMFirst(DeepseekV3ForCausalLLM):
 
         tokens = tokens.unsqueeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can add a dim to walk around.
 
-        print(f"{time.time()}, DSV3 forward rank={rank}, DeepseekV3ForCausalLLMFirst tokens={tokens}, positions={positions}")
+        # print(f"{time.time()}, DSV3 forward rank={rank}, DeepseekV3ForCausalLLMFirst tokens={tokens}, positions={positions}")
 
         seqlen = tokens.size(1)
         mask = None
@@ -1344,16 +1343,16 @@ class DeepseekV3ForCausalLLMFirst(DeepseekV3ForCausalLLM):
         h = self.embed_tokens(tokens)
 
         for layer_idx, layer in enumerate(self.layers):
-            if rank == 0 or rank == 3:
-                print(f"layer{self.pp_start_layer_id + layer_idx} input h at top most={h}", flush=True)
-            if self.pp_node_type == PPNodeType.PPNodeFirst:
-                save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-input_h_at_top_most.safetensor")
+            # if rank == 0 or rank == 3:
+            #     print(f"layer{self.pp_start_layer_id + layer_idx} input h at top most={h}", flush=True)
+            # if self.pp_node_type == PPNodeType.PPNodeFirst:
+            #     save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-input_h_at_top_most.safetensor")
 
             h = layer(h, positions, freqs_cis, mask)
-            if rank == 0:
-                print(f'layer{self.pp_start_layer_id + layer_idx} output h at top most={h}', flush=True)
-            if self.pp_node_type == PPNodeType.PPNodeFirst:
-                save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-output_h_at_top_most.safetensor")
+            # if rank == 0:
+            #     print(f'layer{self.pp_start_layer_id + layer_idx} output h at top most={h}', flush=True)
+            # if self.pp_node_type == PPNodeType.PPNodeFirst:
+            #     save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-output_h_at_top_most.safetensor")
 
         h = h.squeeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can remove a dim to walk around.
         return h
@@ -1380,12 +1379,12 @@ class DeepseekV3ForCausalLLMMiddle(DeepseekV3ForCausalLLM):
 
         freqs_cis = self.freqs_cis[positions]
         for layer_idx, layer in enumerate(self.layers):
-            if rank == 0 or rank == 3:
-                save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-input_h_at_top_most.safetensor")
+            # if rank == 0 or rank == 3:
+            #     save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-input_h_at_top_most.safetensor")
             h = layer(h, positions, freqs_cis, mask)
 
-            if rank == 0 or rank == 3:
-                save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-output_h_at_top_most.safetensor")
+            # if rank == 0 or rank == 3:
+            #     save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-output_h_at_top_most.safetensor")
         
         h = h.squeeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can remove a dim to walk around.
         return h
@@ -1412,34 +1411,34 @@ class DeepseekV3ForCausalLLMLast(DeepseekV3ForCausalLLM):
         print(f"{time.time()}, rank={get_tp_rank()}, DeepseekV3ForCausalLLMLast's forward before layers", flush=True)
 
         for layer_idx, layer in enumerate(self.layers):
-            if rank == 0 or rank == 3:
-                save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-input_h_at_top_most.safetensor")
+            # if rank == 0 or rank == 3:
+            #     save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-input_h_at_top_most.safetensor")
             h = layer(h, positions, freqs_cis, mask)
 
-            if rank == 0 or rank == 3:
-                save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-output_h_at_top_most.safetensor")
+            # if rank == 0 or rank == 3:
+            #     save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer{self.pp_start_layer_id + layer_idx}-output_h_at_top_most.safetensor")
 
         print(f"{time.time()}, rank={get_tp_rank()}, DeepseekV3ForCausalLLMLast's forward before norm", flush=True)
 
         h = self.norm(h)[:, -1]
 
-        if rank == 0 or rank == 3:
-            save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer-last-output_h_after_norm_at_top_most.safetensor")
+        # if rank == 0 or rank == 3:
+        #     save_file({"h":h}, f"dumps/{time.time()}_rank{rank}-layer-last-output_h_after_norm_at_top_most.safetensor")
 
         if context.is_prefill:
             logits = torch.randn(list(h.shape[:-1]) + [self.args.vocab_size // world_size], device=h.device, dtype=h.dtype)
         else:
             logits = self.lm_head(h)
 
-        if rank == 0 or rank == 3:
-            save_file({"logits":logits}, f"dumps/{time.time()}_rank{rank}-layer-last-output_logits.safetensor")
+        # if rank == 0 or rank == 3:
+        #     save_file({"logits":logits}, f"dumps/{time.time()}_rank{rank}-layer-last-output_logits.safetensor")
 
         all_logits = [torch.empty_like(logits) for _ in range(world_size)]
         dist.all_gather(all_logits, logits, group=get_tp_group())
 
         logits = torch.cat(all_logits, dim=-1)
-        if rank == 0 or rank == 3:
-            save_file({"all_logits":logits}, f"dumps/{time.time()}_rank{rank}-layer-last-output_all_logits_after_gather.safetensor")
+        # if rank == 0 or rank == 3:
+        #     save_file({"all_logits":logits}, f"dumps/{time.time()}_rank{rank}-layer-last-output_all_logits_after_gather.safetensor")
 
 
         logits = logits.squeeze(0) # FIXME: nano-vllm use cumulated input, but our's doesn't support it yet. for now, batch size is 1, so we can remove a dim to walk around.
