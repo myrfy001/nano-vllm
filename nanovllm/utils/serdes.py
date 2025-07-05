@@ -184,7 +184,7 @@ def invoke_serialize_context_kernel(
         int(is_prefill),
         slot_mapping, slot_mapping.size(0),
         context_lens, context_lens.size(0),
-        block_tables, block_tables.size(0),
+        block_tables, block_tables.size(1),
         hidden_state, hidden_state.size(0),
         positions, positions.size(0),
         buf, buf.stride(0),
@@ -209,7 +209,7 @@ def invoke_deserialize_context_kernel(
         meta,
         slot_mapping, slot_mapping.size(0),
         context_lens, context_lens.size(0),
-        block_tables, block_tables.size(0),
+        block_tables, block_tables.size(1),
         hidden_state, hidden_state.size(0),
         positions, positions.size(0),
         BLOCK_SIZE=1024

@@ -16,6 +16,8 @@ from nanovllm.utils.context import set_context, get_context, reset_context, Cont
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.serdes import invoke_deserialize_context_kernel, invoke_serialize_context_kernel
 
+from safetensors.torch import save_file
+
 class ModelRunner:
 
     def __init__(self, config: Config, tp_rank: int, mp_queue):
@@ -204,6 +206,9 @@ class ModelRunner:
             # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
             torch.cuda.synchronize()
             dist.send(self.buf_tensor, self.next_pp_head_node_global_rank)
+            if self.tp_rank == 0:
+                save_file({"buf_tensor":self.buf_tensor}, "dumps/buf_tensor_send.safetensor")
+                # raise SystemExit
             torch.cuda.synchronize()
         else:
             # for last node, send logits instead of hidden state
@@ -289,7 +294,7 @@ class ModelRunner:
         config.num_kvcache_blocks = int(total * gpu_memory_utilization - used) // block_bytes
         
         # TODO：harded coded for deepseek v3 and MLA
-        self.kv_cache = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, kv_cache_head_dim)
+        self.kv_cache = torch.zeros(hf_config.num_hidden_layers, min(4096, config.num_kvcache_blocks), self.block_size, num_kv_heads, kv_cache_head_dim)
         # self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         
         from safetensors import safe_open
@@ -375,9 +380,9 @@ class ModelRunner:
         
         
         for seq in seqs:
-            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), seq.block_table={seq.block_table}, seq.last_block_num_tokens={seq.last_block_num_tokens}, seq.num_cached_blocks={seq.num_cached_blocks}")
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), {seq=}")
             input_ids.append(seq.last_token)
-            positions.append(len(seq))
+            positions.append(len(seq)-1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         
@@ -389,7 +394,7 @@ class ModelRunner:
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(device=self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
 
-        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), after create tensor input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), after create tensor input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
 
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
 
@@ -459,6 +464,9 @@ class ModelRunner:
             
             graph_vars["outputs"][:bs] = self.model(graph_vars["input_tensor"][:bs], graph_vars["positions"][:bs])
 
+            if self.pp_node_type == PPNodeType.PPNodeFirst:
+                save_file({"kv_cache":self.kv_cache}, f"dumps/{time.time()}_rank{self.rank}-all_kv_caches.safetensor")
+
             torch.cuda.synchronize()
             # print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() after model replay', flush=True)
 
@@ -502,7 +510,7 @@ class ModelRunner:
         token_ids = None
         if self.tp_rank == 0:
             context = get_context()
-            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), before send_pp_cmd(), context={context}")
+            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), before send_pp_cmd(), context={context}")
             
             self.send_pp_cmd(context, hidden_state, positions)
             # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), after send_pp_cmd()")
@@ -529,12 +537,17 @@ class ModelRunner:
         assert self.pp_node_type != PPNodeType.PPNodeFirst
         
         # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), enter hidden_state={hidden_state}, positions={positions}")
-        local_buf_tensor = buf_tensor.to(self.device, non_blocking=True)
+        # local_buf_tensor = buf_tensor.to(self.device, non_blocking=True)
 
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before deserialize, {buf_tensor=}")
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before deserialize, {self.graph_vars=}")
 
+        # if self.tp_rank == 0:
+        #     save_file({"buf_tensor":buf_tensor}, "dumps/buf_tensor_recv.safetensor")
+        #     raise SystemExit
 
         invoke_deserialize_context_kernel(
-            local_buf_tensor,
+            buf_tensor,
             self.meta_buf,
             self.graph_vars["slot_mapping"],
             self.graph_vars["context_lens"],
@@ -545,8 +558,10 @@ class ModelRunner:
         
         torch.cuda.synchronize()
         local_meta_buf_slice = self.meta_buf[0:6].tolist()
+
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), after deserialize, {self.graph_vars=}")
         
-        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), local_meta_buf_slice={local_meta_buf_slice}", flush=True)
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), local_meta_buf_slice={local_meta_buf_slice}", flush=True)
         is_prefill = bool(int(local_meta_buf_slice[0]))
         slot_mapping_size = local_meta_buf_slice[1]
         context_lens_size = local_meta_buf_slice[2]
@@ -556,10 +571,12 @@ class ModelRunner:
 
         slot_mapping = self.graph_vars["slot_mapping"][:slot_mapping_size]
         context_lens = self.graph_vars["context_lens"][:context_lens_size]
-        block_tables = self.graph_vars["block_tables"][:block_tables_size]
+        block_tables = self.graph_vars["block_tables"][:1][:block_tables_size]
         hidden_state = self.graph_vars["input_tensor"][:hidden_state_size]
         positions = self.graph_vars["positions"][:positions_size]
 
+
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before set context, {slot_mapping=}, {context_lens=}, {block_tables=}", flush=True)
 
         # TODO: FIXME: hard code to None and 0 since not support batch and cumulate now
         set_context(
@@ -574,7 +591,7 @@ class ModelRunner:
         )
 
 
-        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before run_model()")
+        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before run_model(), context={get_context()}", flush=True)
         hidden_state = self.run_model(hidden_state, positions, is_prefill)
         # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), after run_model()")
 

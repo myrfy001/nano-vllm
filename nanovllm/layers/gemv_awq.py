@@ -321,7 +321,7 @@ def compare_tensors(tensor1, tensor2, rtol=1e-5, atol=1e-8, top_k=5):
 # 测试代码
 if __name__ == "__main__":
     torch.manual_seed(0)
-    M, N = 7168, 18432
+    M, N = 2048, 7168
     a = torch.randn((M, N), device='cuda', dtype=torch.float16)
     x = torch.randn(N, device='cuda', dtype=torch.float16)
     b = torch.randn(M, device='cuda', dtype=torch.float16)
@@ -369,6 +369,7 @@ if __name__ == "__main__":
         for _ in range(50):
             # torch.mv(mat, vec)
             gemv(x, a, b, y_triton)
+            F.linear(x, a, b)
             torch.cuda.synchronize()
             prof.step()
             

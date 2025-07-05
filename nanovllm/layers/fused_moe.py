@@ -2,13 +2,11 @@ import triton
 import triton.language as tl
 import torch
 
-print("before import vllm")
 from vllm import _custom_ops as ops
 from vllm.model_executor.utils import set_weight_attrs
-print("after import vllm")
 from typing import Any, Dict, List, Optional, Tuple
 from torch.profiler import ProfilerActivity
-
+from nanovllm.utils.context import get_context, get_tp_rank, get_tp_world_size
 
 @triton.autotune(
     configs=[
@@ -29,6 +27,10 @@ def awq_dequantize_kernel(
         result_ptr,  # Output matrix
         num_cols,  # input num cols in qweight
         num_rows,  # input num rows in qweight
+        stride_wy, stride_wx,
+        stride_sy, stride_sx,
+        stride_zy, stride_zx,
+        stride_oy, stride_ox,
         BLOCK_SIZE_X: tl.constexpr,
         BLOCK_SIZE_Y: tl.constexpr):
     # Setup the pids.
@@ -38,7 +40,7 @@ def awq_dequantize_kernel(
     # Compute offsets and masks for qweight_ptr.
     offsets_y = pid_y * BLOCK_SIZE_Y + tl.arange(0, BLOCK_SIZE_Y)
     offsets_x = pid_x * BLOCK_SIZE_X + tl.arange(0, BLOCK_SIZE_X)
-    offsets = num_cols * offsets_y[:, None] + offsets_x[None, :]
+    offsets = offsets_y[:, None] * stride_wy + offsets_x[None, :] * stride_wx
 
     masks_y = offsets_y < num_rows
     masks_x = offsets_x < num_cols
@@ -49,8 +51,8 @@ def awq_dequantize_kernel(
     result_offsets_y = pid_y * BLOCK_SIZE_Y + tl.arange(0, BLOCK_SIZE_Y)
     result_offsets_x = pid_x * BLOCK_SIZE_X * 8 + tl.arange(
         0, BLOCK_SIZE_X * 8)
-    result_offsets = (8 * num_cols * result_offsets_y[:, None] +
-                      result_offsets_x[None, :])
+    result_offsets = (result_offsets_y[:, None] * stride_oy +
+                      result_offsets_x[None, :] * stride_ox)
 
     result_masks_y = result_offsets_y < num_rows
     result_masks_x = result_offsets_x < num_cols * 8
@@ -58,12 +60,12 @@ def awq_dequantize_kernel(
 
     # Load the weights.
     iweights = tl.load(qweight_ptr + offsets, masks, 0.0)
-    # iweights = tl.interleave(iweights, iweights)
-    # iweights = tl.interleave(iweights, iweights)
-    # iweights = tl.interleave(iweights, iweights)
-    iweights = tl.reshape(iweights, (BLOCK_SIZE_Y * BLOCK_SIZE_X, 1))
-    iweights = tl.broadcast_to(iweights, (BLOCK_SIZE_Y * BLOCK_SIZE_X, 8))
-    iweights = tl.reshape(iweights, (BLOCK_SIZE_Y, BLOCK_SIZE_X * 8))
+    iweights = tl.interleave(iweights, iweights)
+    iweights = tl.interleave(iweights, iweights)
+    iweights = tl.interleave(iweights, iweights)
+    # iweights = tl.reshape(iweights, (BLOCK_SIZE_Y * BLOCK_SIZE_X, 1))
+    # iweights = tl.broadcast_to(iweights, (BLOCK_SIZE_Y * BLOCK_SIZE_X, 8))
+    # iweights = tl.reshape(iweights, (BLOCK_SIZE_Y, BLOCK_SIZE_X * 8))
 
     # Create reverse AWQ order as tensor: [0, 4, 1, 5, 2, 6, 3, 7]
     # that will map given indices to the correct order.
@@ -82,7 +84,7 @@ def awq_dequantize_kernel(
     # Compute zero offsets and masks.
     zero_offsets_y = pid_y * BLOCK_SIZE_Y // group_size + tl.arange(0, 1)
     zero_offsets_x = pid_x * BLOCK_SIZE_X + tl.arange(0, BLOCK_SIZE_X)
-    zero_offsets = num_cols * zero_offsets_y[:, None] + zero_offsets_x[None, :]
+    zero_offsets = zero_offsets_y[:, None] * stride_zy + zero_offsets_x[None, :] * stride_zx
 
     zero_masks_y = zero_offsets_y < num_rows // group_size
     zero_masks_x = zero_offsets_x < num_cols
@@ -90,12 +92,13 @@ def awq_dequantize_kernel(
 
     # Load the zeros.
     zeros = tl.load(zeros_ptr + zero_offsets, zero_masks, 0.0)
-    # zeros = tl.interleave(zeros, zeros)
-    # zeros = tl.interleave(zeros, zeros)
-    # zeros = tl.interleave(zeros, zeros)
-    zeros = tl.reshape(zeros, (BLOCK_SIZE_X, 1))
-    zeros = tl.broadcast_to(zeros, (BLOCK_SIZE_X, 8))
-    zeros = tl.reshape(zeros, (1, BLOCK_SIZE_X * 8))
+    zeros = tl.interleave(zeros, zeros)
+    zeros = tl.interleave(zeros, zeros)
+    zeros = tl.interleave(zeros, zeros)
+    # zeros = tl.reshape(zeros, (BLOCK_SIZE_X, 1))
+    # zeros = tl.broadcast_to(zeros, (BLOCK_SIZE_X, 8))
+    # zeros = tl.reshape(zeros, (1, BLOCK_SIZE_X * 8))
+
     zeros = tl.broadcast_to(zeros, (BLOCK_SIZE_Y, BLOCK_SIZE_X * 8))
 
     # Unpack and reorder: shift out the correct 4-bit value and mask.
@@ -105,8 +108,8 @@ def awq_dequantize_kernel(
     scale_offsets_y = pid_y * BLOCK_SIZE_Y // group_size + tl.arange(0, 1)
     scale_offsets_x = (pid_x * BLOCK_SIZE_X * 8 +
                        tl.arange(0, BLOCK_SIZE_X * 8))
-    scale_offsets = (num_cols * 8 * scale_offsets_y[:, None] +
-                     scale_offsets_x[None, :])
+    scale_offsets = (scale_offsets_y[:, None] * stride_sy +
+                     scale_offsets_x[None, :] * stride_sx)
     scale_masks_y = scale_offsets_y < num_rows // group_size
     scale_masks_x = scale_offsets_x < num_cols * 8
     scale_masks = scale_masks_y[:, None] & scale_masks_x[None, :]
@@ -133,9 +136,6 @@ def awq_dequantize_triton(qweight: torch.Tensor,
                           block_size_y: int = 32) -> torch.Tensor:
     K = qweight.shape[0]
     M = scales.shape[1]
-    # print(f'DEBUG: {qweight.shape=}')
-    # print(f'DEBUG: {scales.shape=}')
-    # print(f'DEBUG: {zeros.shape=}')
     group_size = qweight.shape[0] // scales.shape[0]
 
     AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
@@ -161,13 +161,21 @@ def awq_dequantize_triton(qweight: torch.Tensor,
         triton.cdiv(X, META['BLOCK_SIZE_X']),
         triton.cdiv(Y, META['BLOCK_SIZE_Y']),
     )
-    awq_dequantize_kernel[grid](qweight,
-                                scales,
-                                zeros,
-                                group_size,
-                                result,
-                                X,
-                                Y)
+    # print(f'num_cols={X}, num_rows={Y}')
+    # print(f'{qweight.stride(0)=}, {qweight.stride(1)=}, {scales.stride(0)=}, {scales.stride(1)=}, {zeros.stride(0)=}, {zeros.stride(1)=}, {result.stride(0)=}, {result.stride(1)=},')
+    awq_dequantize_kernel[grid](
+        qweight,
+        scales,
+        zeros,
+        group_size,
+        result,
+        X,
+        Y,
+        qweight.stride(0), qweight.stride(1),
+        scales.stride(0), scales.stride(1),
+        zeros.stride(0), zeros.stride(1),
+        result.stride(0), result.stride(1),
+    )
     return result
 
 
@@ -176,6 +184,7 @@ def generate_expert_weight(
     use_int4_w4a16: bool = False,
     group_size: int = 128,
     dequantize: bool = False,
+    topk_ids: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if use_int4_w4a16:
         w_quantized = torch.randint(0, torch.iinfo(torch.int32).max, (E, K, N // 8), dtype=torch.int32)
@@ -183,12 +192,14 @@ def generate_expert_weight(
         w_zeros = torch.randint(0, torch.iinfo(torch.int32).max, (E, K // group_size, N // 8), dtype=torch.int32)
         w_zeros &= 0x11111111
         w_scales = torch.rand((E, K // group_size, N))
-        w_scales /= 1000
+        w_scales /= 100
         w = w_quantized
         # w = awq_dequantize_triton(w_quantized, w_scales, w_zeros)
         if dequantize:
             w_list = []
             for e in range(E):
+                if topk_ids is not None and e not in topk_ids:
+                    continue
                 # 提取当前 E 索引下的二维切片
                 w_quantized_2d = w_quantized[e]  # 形状: (K, 2*N//8)
                 w_zeros_2d = w_zeros[e]          # 形状: (K//group_size, 2*N//8)
@@ -711,6 +722,7 @@ def normal_topk(
     original_scores = gating_output
     if bias is not None:
         gating_output = gating_output + bias
+    # print(f'MoE: {gating_output=}')
     if num_expert_group > 1:
         gating_output = gating_output.view(hidden_states.size(0), num_expert_group, -1)
         if bias is None:
@@ -786,12 +798,35 @@ def fused_experts(
         B_scales=w13_scales,
         B_zeros=w13_zeros,
     )
-    # print(f'{cache1=}')
+    # o1_a, o3_a = cache1.chunk(2, dim=-1)
+    # for i in range(top_k):
+        # expert_id = topk_ids[:, i].item()
+        # print(f'MoE: SELECT {expert_id=}')
+
+        # qweight = w13[expert_id]
+        # scales = w13_scales[expert_id]
+        # zeros = w13_zeros[expert_id]
+        # weight = awq_dequantize_triton(qweight.T, scales.T, zeros.T).T
+        # w1, w3 = weight.chunk(2, 0)
+        # print(f'MoE: {w1.shape=}')
+        # print(f'MoE: {w1=}')
+        # print(f'MoE: {w3=}')
+
+        # o1= o1_a[:, i, :]
+        # o3= o3_a[:, i, :]
+        # print(f'MoE: {o1=}')
+        # print(f'MoE: {o3=}')
+
+        # torch.testing.assert_close(o1, torch.nn.functional.linear(hidden_states, w1), atol=1e-2, rtol=1e-2)
+        # torch.testing.assert_close(o3, torch.nn.functional.linear(hidden_states, w3), atol=1e-2, rtol=1e-2)
 
     torch.ops._C.silu_and_mul(cache2, cache1.view(-1, 2 * N))
     # x = cache1.view(-1, 2 * N)
     # cache2 = torch.nn.functional.silu(x[..., :N]) * x[..., N:]
-    # print(f'{cache2=}')
+    # for i in range(top_k):
+        # print(f'MoE: SELECT {topk_ids[:, i].item()}')
+        # c2 = cache2[i, :]
+        # print(f'MoE: {c2=}')
 
     w2_awq_config = {
         'BLOCK_SIZE_M': 1,
@@ -814,7 +849,10 @@ def fused_experts(
         B_scales=w2_scales,
         B_zeros=w2_zeros,
     )
-    # print(f'{cache3=}')
+    # for i in range(top_k):
+        # print(f'MoE: SELECT {topk_ids[:, i].item()}')
+        # o2 = cache3[:, i, :]
+        # print(f'MoE: {o2=}')
 
     ops.moe_sum(cache3.view(*cache3.shape), out_hidden_states)
     # torch.sum(cache3.view(*cache3.shape), dim=1, out=out_hidden_states)
@@ -855,6 +893,7 @@ class FusedMoE(torch.nn.Module):
         use_grouped_topk: bool = True,
         num_expert_group: int = None,
         topk_group: int = None,
+        quant_config = None,
         tp_size: Optional[int] = None,
         ep_size: Optional[int] = None,
         dp_size: Optional[int] = None,
@@ -872,8 +911,7 @@ class FusedMoE(torch.nn.Module):
 
         # Note: here we guard against accessing the TP and DP groups when
         # uninitialized (this happens when testing)
-        assert tp_size is not None, "Tensor parallel size must be set"
-        self.tp_size = tp_size
+        self.tp_size = tp_size if tp_size is not None else get_tp_world_size()
         # tp_rank = 0 if self.tp_size == 1 else get_tensor_model_parallel_rank()
         # self.dp_size = (dp_size
         #                 if dp_size is not None else get_dp_group().world_size)
@@ -905,6 +943,7 @@ class FusedMoE(torch.nn.Module):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.scoring_func = scoring_func
+        self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
 
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -920,17 +959,14 @@ class FusedMoE(torch.nn.Module):
             # "weight_loader": self.weight_loader,
             "is_transposed": True,
             "quant_method": "awq",
-            "tp_size": self.tp_size,
         }
 
         # create awq weight
         w13_qweight = torch.nn.Parameter(
             torch.empty(
-                [
-                    num_experts,
-                    hidden_size,
-                    2 * intermediate_size_per_partition // 8,
-                ],
+                num_experts,
+                hidden_size,
+                2 * intermediate_size_per_partition // 8,
                 dtype=torch.int32,
             ).transpose(1, 2),
             requires_grad=False,
@@ -940,11 +976,9 @@ class FusedMoE(torch.nn.Module):
 
         w2_qweight = torch.nn.Parameter(
             torch.empty(
-                [
-                    num_experts,
-                    intermediate_size_per_partition,
-                    hidden_size // 8,
-                ],
+                num_experts,
+                intermediate_size_per_partition,
+                hidden_size // 8,
                 dtype=torch.int32,
             ).transpose(1, 2),
             requires_grad=False,
@@ -952,14 +986,14 @@ class FusedMoE(torch.nn.Module):
         self.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, moe_quant_params)
 
-        group_size = 128
+        group_size = quant_config['group_size'] if quant_config is not None else 128
         num_groups_w13 = hidden_size // group_size
         num_groups_w2 = intermediate_size_per_partition // group_size
 
         # WEIGHT_SCALES
         # Allocate 2 scales for w1 and w3 respectively.
         w13_scales = torch.nn.Parameter(
-            torch.randn(
+            torch.empty(
                 num_experts,
                 num_groups_w13,
                 intermediate_size_per_partition * 2,
@@ -971,7 +1005,7 @@ class FusedMoE(torch.nn.Module):
         set_weight_attrs(w13_scales, moe_quant_params)
 
         w2_scales = torch.nn.Parameter(
-            torch.randn(
+            torch.empty(
                 num_experts,
                 num_groups_w2,
                 hidden_size,
@@ -986,11 +1020,9 @@ class FusedMoE(torch.nn.Module):
         # Allocate 2 zero points for w1 and w3 respectively.
         w13_qzeros = torch.nn.Parameter(
             torch.empty(
-                [
-                    num_experts,
-                    num_groups_w13,
-                    2 * intermediate_size_per_partition // 8,
-                ],
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition // 8,
                 dtype=torch.int32,
             ).transpose(1, 2),
             requires_grad=False,
@@ -1000,21 +1032,19 @@ class FusedMoE(torch.nn.Module):
 
         w2_qzeros = torch.nn.Parameter(
             torch.empty(
-                [
-                    num_experts,
-                    num_groups_w2,
-                    hidden_size // 8,
-                ],
+                num_experts,
+                num_groups_w2,
+                hidden_size // 8,
                 dtype=torch.int32,
             ).transpose(1, 2),
             requires_grad=False,
         )
-
         self.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, moe_quant_params)
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         # print(f'MOE: {router_logits=}')
+        '''
         topk_weights, topk_ids = grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -1023,24 +1053,230 @@ class FusedMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             topk_group=self.topk_group,
             scoring_func=self.scoring_func,
+            e_score_correction_bias=self.e_score_correction_bias,
         )
-        # topk_weights, topk_ids = normal_topk(
-        #     hidden_states=hidden_states,
-        #     gating_output=router_logits,
-        #     topk=self.top_k,
-        #     renormalize=self.renormalize,
-        #     num_expert_group=self.num_expert_group,
-        #     topk_group=self.topk_group,
-        #     scoring_func=self.scoring_func,
-        # )
-        # print(f'{topk_weights=}, {topk_ids=}')
+        '''
+        topk_weights, topk_ids = normal_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+            num_expert_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            scoring_func=self.scoring_func,
+            bias=self.e_score_correction_bias,
+        )
+        # print(f'MoE: {topk_weights=}')
+        # print(f'MoE: {topk_ids=}')
 
         return fused_experts(
             hidden_states, self.w13_qweight, self.w2_qweight,
             topk_weights, topk_ids,
-            inplace=True,
+            # TODO(fh): change inplace
+            inplace=False,
             use_int4_w4a16=True,
             w13_scales=self.w13_scales, w13_zeros=self.w13_qzeros,
             w2_scales=self.w2_scales, w2_zeros=self.w2_qzeros,
             block_shape=[0, 128],
         )
+
+
+def check_fused_moe_kernel(M: int, K: int, N: int, E: int, top_k: int):
+    topk_ids = list(range(top_k))
+    topk_weights = torch.ones([M, top_k])
+    hidden_states = torch.randn((M, K))
+    cache13 = torch.empty(M * top_k * max(2 * N, K))
+    cache1 = torch.empty([M, top_k, 2 * N])
+    cache3 = cache13[:M * top_k * K].view(M, top_k, K)
+    cache2 = torch.empty((M * top_k, N))
+
+    w13, w13_quantize, w13_scales, w13_zeros = generate_expert_weight(K, 2 * N, E, use_int4_w4a16=True, dequantize=True, topk_ids=topk_ids)
+    print(f'{w13.shape=}, {w13_quantize.shape=}')
+
+    topk_ids = torch.tensor(topk_ids, dtype=torch.int32).broadcast_to([M, top_k])
+    config = {
+        'BLOCK_SIZE_M': 1,
+        'BLOCK_SIZE_N': 128,
+        'BLOCK_SIZE_K': 16,
+        'SUM_WAY': 0,
+        'SPLIT_K': 8,
+        'num_warps': 4,
+        'num_stages':1
+    }
+    invoke_gemv_fused_moe_kernel(
+        hidden_states, w13_quantize, cache1,
+        topk_weights,
+        topk_ids,
+        mul_routed_weight=False,
+        top_k=top_k,
+        compute_type=tl.float16,
+        config=config,
+        use_int4_w4a16=True,
+        B_scales=w13_scales,
+        B_zeros=w13_zeros,
+    )
+    ref = torch.einsum("bh,ehd->bed", hidden_states, w13.transpose(1, 2))
+    if torch.allclose(cache1, ref, atol=1e-2, rtol=1e-2):
+        print(f'----PASS---- {config=}')
+    torch.testing.assert_close(cache1, ref, atol=1e-2, rtol=1e-2)
+    print(f'MOE: {cache1=}')
+    print(f'REF: {ref=}')
+
+def check_fused_experts(M: int, K: int, N: int, E: int, A: int):
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts as ref_experts
+    hidden_states = torch.randn((M, K))
+    w13, w13_quantize, w13_scales, w13_zeros = generate_expert_weight(K, 2 * N, E, use_int4_w4a16=True, dequantize=True)
+    w2, w2_quantize, w2_scales, w2_zeros = generate_expert_weight(N, K, E, use_int4_w4a16=True, dequantize=True)
+    topk_weights = torch.randn((M, A))
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_ids = torch.randint(0, E, (M, A), dtype=torch.int32)
+
+    w13 = w13.contiguous()
+    w2 = w2.contiguous()
+    ref = ref_experts(
+        hidden_states, w13, w2,
+        topk_weights, topk_ids,
+        inplace=False,
+    )
+    assert(not torch.allclose(ref, hidden_states))
+    x = fused_experts(
+        hidden_states, w13_quantize, w2_quantize,
+        topk_weights, topk_ids,
+        inplace=False,
+        use_int4_w4a16=True,
+        w13_scales=w13_scales, w13_zeros=w13_zeros,
+        w2_scales=w2_scales, w2_zeros=w2_zeros,
+        block_shape=[0, 128],
+    )
+    assert(not torch.allclose(x, hidden_states))
+
+    # torch.testing.assert_close(x, ref, atol=1e-2, rtol=1e-2)
+    print(f'Fused Experts Check: {torch.allclose(x, ref, atol=1e-2, rtol=1e-2)}')
+    print(f'{x=}')
+    print(f'{ref=}')
+
+
+def test_fused_experts(M: int, K: int, N: int, E: int, A: int):
+    hidden_states = torch.rand((M, K))
+    _, w13, w13_scales, w13_zeros = generate_expert_weight(K, 2 * N, E, use_int4_w4a16=True)
+    _, w2, w2_scales, w2_zeros = generate_expert_weight(N, K, E, use_int4_w4a16=True)
+    topk_weights = torch.randn((M, A))
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_ids = torch.randint(0, E, (M, A), dtype=torch.int32)
+
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["id"],
+            x_vals=list(range(4)),
+            line_arg="provider",
+            line_vals=["fused_expert"],
+            line_names=["fused_expert"],
+            ylabel="Time (ms)",
+            plot_name=f"fused_experts AWQ Performance {E=}, {M=}, {K=}, {N=}, {A=}",
+            args={},
+        )
+    )
+    def benchmark_moe(id: int, provider):
+        quantiles = [0.5, 0.2, 0.8]
+        if provider == 'fused_expert':
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: fused_experts(
+                    hidden_states, w13, w2,
+                    topk_weights, topk_ids,
+                    inplace=True,
+                    use_int4_w4a16=True,
+                    w13_scales=w13_scales, w13_zeros=w13_zeros,
+                    w2_scales=w2_scales, w2_zeros=w2_zeros,
+                    block_shape=[0, 128],
+                ),
+                quantiles=quantiles,
+            )
+        return ms
+
+    benchmark_moe.run(print_data=True, show_plots=False)
+
+    with torch.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=0, warmup=5, active=80),
+        record_shapes=True,
+        with_stack=True,
+        profile_memory=True,
+    ) as prof:
+        for _ in range(100):
+            fused_experts(
+                hidden_states, w13, w2,
+                topk_weights, topk_ids,
+                inplace=True,
+                use_int4_w4a16=True,
+                w13_scales=w13_scales, w13_zeros=w13_zeros,
+                w2_scales=w2_scales, w2_zeros=w2_zeros,
+                block_shape=[0, 128],
+            )
+            prof.step()
+    prof.export_chrome_trace(f"fused_experts-{M=}-{K=}-{N=}-{E=}-{A=}.json.gz")
+
+
+def test_fused_moe(M: int, K: int, N: int, E: int, A: int):
+    hidden_states = torch.rand((M, K))
+    router_logits = torch.rand((M, E))
+    moe = FusedMoE(
+        E, A, K, N,
+        params_dtype=torch.float16,
+        renormalize=True,
+        num_expert_group=8,
+        topk_group=4,
+        prefix="fused-moe",
+        scoring_func="sigmoid",
+        apply_router_weight_on_input=False,
+        activation="silu",
+    )
+
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["id"],
+            x_vals=list(range(4)),
+            line_arg="provider",
+            line_vals=["fused_moe"],
+            line_names=["Fused MoE"],
+            ylabel="Time (ms)",
+            plot_name=f"Fused MoE AWQ Performance {E=}, {M=}, {K=}, {N=}, {A=}",
+            args={},
+        )
+    )
+    def benchmark_moe(id: int, provider):
+        quantiles = [0.5, 0.2, 0.8]
+        if provider == 'fused_moe':
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: moe(hidden_states, router_logits), quantiles=quantiles)
+        return ms
+
+    benchmark_moe.run(print_data=True, show_plots=False)
+    with torch.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=0, warmup=5, active=80),
+        record_shapes=True,
+        with_stack=True,
+        profile_memory=True,
+    ) as prof:
+        for _ in range(100):
+            moe(hidden_states, router_logits)
+            prof.step()
+    prof.export_chrome_trace(f"fused_moe-{M=}-{K=}-{N=}-{E=}-{A=}.json.gz")
+
+
+def main():
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(torch.float16)
+    torch.manual_seed(0)
+
+    M, K, N, E, top_k = 1, 7168, 2048, 256, 8
+    # M, K, N, E, top_k = 1, 7168, 2048, 64, 8
+
+    check_fused_moe_kernel(M, K, N, E, top_k)
+    # check_fused_experts(M, K, N, E, top_k)
+    # test_fused_experts(M, K, N, E, top_k)
+    # test_fused_moe(M, K, N, E, top_k)
+
+
+if __name__ == '__main__':
+    main()
+

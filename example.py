@@ -14,7 +14,7 @@ def main(node_id: int, node_num: int):
         time.sleep(100000)
         raise SystemExit
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=50)
+    sampling_params = SamplingParams(temperature=0, max_tokens=3)
     prompts = [
         "你是谁",
     ]

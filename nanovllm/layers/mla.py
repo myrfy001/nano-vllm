@@ -268,6 +268,7 @@ def mla_decode(
     o: torch.Tensor,            # [B, 128, 512]
     req_to_tokens: torch.Tensor,
     b_seq_len: torch.Tensor,
+    sm_scale,
     config: Dict[str, Any],
 ):
     _, page_size, num_kv_heads, qk_head_dim = kv_c_and_k_pe_cache.shape
@@ -293,7 +294,6 @@ def mla_decode(
 
     # STAGE 1: split phase
     SPLIT_K = config['SPLIT_K']
-    sm_scale = 1.0 / (qk_head_dim ** 0.5)
 
     # print("out", out.shape)
     Mid_O = torch.empty((batch_size, num_q_heads, SPLIT_K, kv_lora_rank + 1), device=q.device, dtype=torch.float32)
