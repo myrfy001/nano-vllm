@@ -173,41 +173,41 @@ class ParallelEmbedding(nn.Module):
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-    if weight.dtype == torch.int32:
-        weight = awq_dequantize_triton(weight.T, weight.scales.T, weight.zeros.T).T
-        # print(f'REF: {weight.shape=}')
-        # print(f'REF: {weight=}')
-        return F.linear(x, weight, bias)
-    if weight.element_size() > 1:
-        return F.linear(x, weight, bias)
-    elif gemm_impl == "bf16":
-        weight = weight_dequant(weight, weight.scale)
-        return F.linear(x, weight, bias)
-    else:
-        raise Exception("should not reach here")
-        x, scale = act_quant(x, block_size)
-        y = fp8_gemm(x, scale, weight, weight.scale)
-        if bias is not None:
-            y += bias
-        return y
-
-
-    # try:
-    #     assert weight.is_contiguous()
-    #     ret = torch.empty(1, weight.size(0), device=x.device, dtype=x.dtype)
-    #     x_shape = x.shape[:-1]
-    #     tb = bias
+    # if weight.dtype == torch.int32:
+    #     weight = awq_dequantize_triton(weight.T, weight.scales.T, weight.zeros.T).T
+    #     # print(f'REF: {weight.shape=}')
+    #     # print(f'REF: {weight=}')
+    #     return F.linear(x, weight, bias)
+    # if weight.element_size() > 1:
+    #     return F.linear(x, weight, bias)
+    # elif gemm_impl == "bf16":
+    #     weight = weight_dequant(weight, weight.scale)
+    #     return F.linear(x, weight, bias)
+    # else:
+    #     raise Exception("should not reach here")
+    #     x, scale = act_quant(x, block_size)
+    #     y = fp8_gemm(x, scale, weight, weight.scale)
     #     if bias is not None:
-    #         tb = bias.reshape(bias.size(-1))
-    #     tx = x.reshape(x.size(-1))
-    #     gemv(tx, weight, tb, ret)
-    #     ret = ret.reshape(*x_shape, weight.size(0))
+    #         y += bias
+    #     return y
+
+
+    try:
+        assert weight.is_contiguous()
+        ret = torch.empty(1, weight.size(0), device=x.device, dtype=x.dtype)
+        x_shape = x.shape[:-1]
+        tb = bias
+        if bias is not None:
+            tb = bias.reshape(bias.size(-1))
+        tx = x.reshape(x.size(-1))
+        gemv(tx, weight, tb, ret)
+        ret = ret.reshape(*x_shape, weight.size(0))
         
-    # except:
-    #     import traceback
-    #     traceback.print_exc()
-    #     import pdb;pdb.set_trace()
-    # return ret
+    except:
+        import traceback
+        traceback.print_exc()
+        import pdb;pdb.set_trace()
+    return ret
 
 
 

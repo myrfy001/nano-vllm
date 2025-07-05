@@ -12,7 +12,7 @@ def serialize_context(
         is_prefill,
         slot_mapping_ptr, slot_mapping_size: tl.constexpr,
         context_lens_ptr, context_lens_size: tl.constexpr,
-        block_tables_ptr, block_tables_size: tl.constexpr,
+        block_tables_ptr, block_tables_size,
         hidden_state_ptr, hidden_state_size: tl.constexpr,
         positions_ptr, positions_size: tl.constexpr,
         buf_ptr,
@@ -93,7 +93,7 @@ def deserialize_context(
         meta_ptr,
         slot_mapping_ptr, slot_mapping_size: tl.constexpr,
         context_lens_ptr, context_lens_size: tl.constexpr,
-        block_tables_ptr, block_tables_size: tl.constexpr,
+        block_tables_ptr, block_tables_size,
         hidden_state_ptr, hidden_state_size: tl.constexpr,
         positions_ptr, positions_size: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
@@ -227,13 +227,13 @@ def test():
 
     src_slot_mapping: torch.Tensor = torch.randint(1, 100, (src_slot_mapping_size,), dtype=torch.int32).cuda()
     src_context_lens: torch.Tensor = torch.randint(1, 100, (src_context_lens_size,), dtype=torch.int32).cuda()
-    src_block_tables: torch.Tensor = torch.randint(1, 100, (src_block_tables_size,), dtype=torch.int32).cuda()
+    src_block_tables: torch.Tensor = torch.randint(1, 100, (1, src_block_tables_size,), dtype=torch.int32).cuda()
     src_hidden_state: torch.Tensor = torch.rand((src_hidden_state_size, 7168), dtype=torch.float16).cuda()
     src_positions: torch.Tensor = torch.randint(1, 100, (src_positions_size,), dtype=torch.int64).cuda()
 
     dst_slot_mapping: torch.Tensor = torch.randint(1, 100, (2048,), dtype=torch.int32).cuda()
     dst_context_lens: torch.Tensor = torch.randint(1, 100, (2048,), dtype=torch.int32).cuda()
-    dst_block_tables: torch.Tensor = torch.randint(1, 100, (2048,), dtype=torch.int32).cuda()
+    dst_block_tables: torch.Tensor = torch.randint(1, 100, (1, 2048,), dtype=torch.int32).cuda()
     dst_hidden_state: torch.Tensor = torch.rand((src_hidden_state_size, 7168), dtype=torch.float16).cuda()
     dst_positions: torch.Tensor = torch.randint(1, 100, (1024,), dtype=torch.int64).cuda()
     dst_meta: torch.Tensor = torch.zeros(8, dtype=torch.uint16).cuda()
@@ -261,7 +261,7 @@ def test():
 
     assert torch.equal(src_slot_mapping, dst_slot_mapping[:src_slot_mapping_size])
     assert torch.equal(src_context_lens, dst_context_lens[:src_context_lens_size])
-    assert torch.equal(src_block_tables, dst_block_tables[:src_block_tables_size])
+    assert torch.equal(src_block_tables[:, :src_block_tables_size], dst_block_tables[:, :src_block_tables_size])
     assert torch.equal(src_positions, dst_positions[:src_positions_size])
 
     assert torch.equal(src_hidden_state, dst_hidden_state)

@@ -111,6 +111,9 @@ class ModelRunner:
 
         if not self.enforce_eager:
             self.capture_cudagraph()
+        
+        
+        self.load_kv_cache()
 
         # torch.set_default_device("cpu")
         # torch.set_default_dtype(default_dtype)
@@ -151,7 +154,7 @@ class ModelRunner:
             prof_early_break_counter = 0
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                schedule=torch.profiler.schedule(wait=0, warmup=10, active=300),
+                schedule=torch.profiler.schedule(wait=0, warmup=2, active=300),
                 record_shapes=True,
                 with_stack=True,
                 profile_memory=True,
@@ -162,8 +165,8 @@ class ModelRunner:
                         break
 
                     prof_early_break_counter += 1
-                    if prof_early_break_counter > 150:
-                        break
+                    # if prof_early_break_counter > 25:
+                    #     break
                     prof.step()
                     
             prof.export_chrome_trace(f"tracing-node-{self.config.node_id}-rank-{self.tp_rank}.json.gz")
@@ -207,8 +210,8 @@ class ModelRunner:
             # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, dist.send size={self.buf_tensor.size()}, dtype={self.buf_tensor.dtype} self.buf_tensor", flush=True)
             torch.cuda.synchronize()
             dist.send(self.buf_tensor, self.next_pp_head_node_global_rank)
-            if self.tp_rank == 0:
-                save_file({"buf_tensor":self.buf_tensor}, "dumps/buf_tensor_send.safetensor")
+            # if self.tp_rank == 0:
+            #     save_file({"buf_tensor":self.buf_tensor}, "dumps/buf_tensor_send.safetensor")
                 # raise SystemExit
             torch.cuda.synchronize()
         else:
@@ -297,15 +300,6 @@ class ModelRunner:
         # TODO：harded coded for deepseek v3 and MLA
         self.kv_cache = torch.zeros(hf_config.num_hidden_layers, min(4096, config.num_kvcache_blocks), self.block_size, num_kv_heads, kv_cache_head_dim)
         # self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
-        
-        from safetensors import safe_open
-        with safe_open("small_phase0_seqlen4_start0.safetensor", "pt", "cpu") as safetensor_file:
-            loaded_kv_cache = safetensor_file.get_tensor("out_kvcache")
-            self.kv_cache[:,:4] = loaded_kv_cache.to(self.device)
-
-        if self.rank == 0:
-            print(f"loaded kv cache = {loaded_kv_cache}")
-            print(f"self.kv_cache for first layer = {self.kv_cache[0]}")
             
 
         layer_id = self.pp_start_layer_id
@@ -317,6 +311,16 @@ class ModelRunner:
             if hasattr(module, "kv_c_and_k_pe_cache"):
                 module.kv_c_and_k_pe_cache = self.kv_cache[layer_id]
                 layer_id += 1
+
+    def load_kv_cache(self):
+        from safetensors import safe_open
+        with safe_open("small_phase0_seqlen4_start0.safetensor", "pt", "cpu") as safetensor_file:
+            loaded_kv_cache = safetensor_file.get_tensor("out_kvcache")
+            self.kv_cache[:,:4] = loaded_kv_cache.to(self.device)
+
+        if self.rank == 0:
+            print(f"loaded kv cache = {loaded_kv_cache}")
+            print(f"self.kv_cache for first layer = {self.kv_cache[0]}")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -381,7 +385,7 @@ class ModelRunner:
         
         
         for seq in seqs:
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), {seq=}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), {seq=}")
             input_ids.append(seq.last_token)
             positions.append(len(seq)-1)
             context_lens.append(len(seq))
@@ -395,7 +399,7 @@ class ModelRunner:
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(device=self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
 
-        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), after create tensor input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in prepare_decode(), after create tensor input_ids={input_ids}, {input_ids.size()}, positions={positions}, {positions.size()}, slot_mapping={slot_mapping}, {slot_mapping.size()}, context_lens={context_lens}, {context_lens.size()}, block_tables={block_tables}, {block_tables.size()}")
 
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
 
@@ -434,7 +438,7 @@ class ModelRunner:
             bs = 1 # TODO: FIXME 
             # bs = input_tensor.size(0)
             
-            # graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             # for k, v in graph_vars.items():
             #     if k != "outputs":
@@ -457,16 +461,26 @@ class ModelRunner:
             #     graph_vars["context_lens"][:bs] = context.context_lens
             #     graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
 
-            if self.rank == 0:
-                # print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model replay, graph_vars={graph_vars}', flush=True)
-                print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model replay, kvcache={self.kv_cache[1]}', flush=True)
+            # if self.rank == 0:
+            #     # print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model replay, graph_vars={graph_vars}', flush=True)
+            #     print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() before model replay, kvcache={self.kv_cache[1]}', flush=True)
+            #     save_file(graph_vars, f"dumps/{time.time()}_rank{self.rank}-graph_vars_before_run_model.safetensor")
+            #     context = get_context()
 
-            # graph.replay()
+            #     save_file({"slot_mapping":context.slot_mapping}, f"dumps/{time.time()}_rank{self.rank}_context_before_run_context_slot_mapping.safetensor")
+            #     save_file({"slot_mapping":context.context_lens}, f"dumps/{time.time()}_rank{self.rank}_context_before_run_context_lens.safetensor")
+            #     save_file({"slot_mapping":context.block_tables}, f"dumps/{time.time()}_rank{self.rank}_context_before_run_context_block_tables.safetensor")
+
+
+            graph.replay()
             
-            graph_vars["outputs"][:bs] = self.model(graph_vars["input_tensor"][:bs], graph_vars["positions"][:bs])
+            # graph_vars["outputs"][:bs] = self.model(graph_vars["input_tensor"][:bs], graph_vars["positions"][:bs])
 
-            if self.pp_node_type == PPNodeType.PPNodeFirst:
-                save_file({"kv_cache":self.kv_cache}, f"dumps/{time.time()}_rank{self.rank}-all_kv_caches.safetensor")
+            # if self.rank == 0:
+            #     save_file(graph_vars, f"dumps/{time.time()}_rank{self.rank}-graph_vars_after_run_model.safetensor")
+
+            # if self.pp_node_type == PPNodeType.PPNodeFirst:
+            #     save_file({"kv_cache":self.kv_cache}, f"dumps/{time.time()}_rank{self.rank}-all_kv_caches.safetensor")
 
             torch.cuda.synchronize()
             # print(f'{time.time()}, rank{self.tp_rank},{self.rank}, in run_model() after model replay', flush=True)
@@ -485,7 +499,7 @@ class ModelRunner:
                 loaded_token_ids = safetensor_file.get_tensor("tokens")
                 token_id = loaded_logit.argmax(dim=-1)
 
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run() prefill before modify seq, seqs[0].token_ids={seqs[0].token_ids}, num_tokens={seqs[0].num_tokens}, num_prompt_tokens={seqs[0].num_prompt_tokens}, num_cached_tokens={seqs[0].num_cached_tokens}, block_table={seqs[0].block_table}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run() prefill before modify seq, seqs[0].token_ids={seqs[0].token_ids}, num_tokens={seqs[0].num_tokens}, num_prompt_tokens={seqs[0].num_prompt_tokens}, num_cached_tokens={seqs[0].num_cached_tokens}, block_table={seqs[0].block_table}")
 
             seqs[0].token_ids = loaded_token_ids[0].tolist()
             seqs[0].num_tokens = len(seqs[0].token_ids)
@@ -493,7 +507,7 @@ class ModelRunner:
             seqs[0].num_cached_tokens = len(seqs[0].token_ids)
             seqs[0].block_table = [i for i in range(len(seqs[0].token_ids))]
 
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run() prefill after modify seq, seqs[0].token_ids={seqs[0].token_ids}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run() prefill after modify seq, seqs[0].token_ids={seqs[0].token_ids}")
             
             token_ids = [int(token_id[0])]
             return token_ids
@@ -511,7 +525,7 @@ class ModelRunner:
         token_ids = None
         if self.tp_rank == 0:
             context = get_context()
-            print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), before send_pp_cmd(), context={context}")
+            # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), before send_pp_cmd(), context={context}")
             
             self.send_pp_cmd(context, hidden_state, positions)
             # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run(), after send_pp_cmd()")
@@ -540,8 +554,8 @@ class ModelRunner:
         # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), enter hidden_state={hidden_state}, positions={positions}")
         # local_buf_tensor = buf_tensor.to(self.device, non_blocking=True)
 
-        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before deserialize, {buf_tensor=}")
-        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before deserialize, {self.graph_vars=}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before deserialize, {buf_tensor=}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before deserialize, {self.graph_vars=}")
 
         # if self.tp_rank == 0:
         #     save_file({"buf_tensor":buf_tensor}, "dumps/buf_tensor_recv.safetensor")
@@ -560,9 +574,9 @@ class ModelRunner:
         torch.cuda.synchronize()
         local_meta_buf_slice = self.meta_buf[0:6].tolist()
 
-        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), after deserialize, {self.graph_vars=}")
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), after deserialize, {self.graph_vars=}")
         
-        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), local_meta_buf_slice={local_meta_buf_slice}", flush=True)
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), local_meta_buf_slice={local_meta_buf_slice}", flush=True)
         is_prefill = bool(int(local_meta_buf_slice[0]))
         slot_mapping_size = local_meta_buf_slice[1]
         context_lens_size = local_meta_buf_slice[2]
@@ -577,7 +591,7 @@ class ModelRunner:
         positions = self.graph_vars["positions"][:positions_size]
 
 
-        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before set context, {slot_mapping=}, {context_lens=}, {block_tables=}", flush=True)
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before set context, {slot_mapping=}, {context_lens=}, {block_tables=}", flush=True)
 
         # TODO: FIXME: hard code to None and 0 since not support batch and cumulate now
         set_context(
@@ -592,7 +606,7 @@ class ModelRunner:
         )
 
 
-        print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before run_model(), context={get_context()}", flush=True)
+        # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), before run_model(), context={get_context()}", flush=True)
         hidden_state = self.run_model(hidden_state, positions, is_prefill)
         # print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in run_non_first_node(), after run_model()")
 
@@ -615,7 +629,7 @@ class ModelRunner:
     
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(self.config.max_num_seqs, 1)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         if self.pp_node_type == PPNodeType.PPNodeFirst:
             input_tensor = torch.zeros(max_bs, dtype=torch.int64)
@@ -635,18 +649,18 @@ class ModelRunner:
 
         # print(f"{time.time()}, rank{self.tp_rank} in capture graph, positions={positions}, {positions.device}")
 
-        # for bs in reversed(self.graph_bs):
-        #     graph = torch.cuda.CUDAGraph()
-        #     set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-        #     outputs[:bs] = self.model(input_tensor[:bs], positions[:bs])    # warmup
-        #     with torch.cuda.graph(graph, self.graph_pool):
-        #         hidden_state = self.model(input_tensor[:bs], positions[:bs])    # capture
-        #         outputs[:bs] = hidden_state
-        #     if self.graph_pool is None:
-        #         self.graph_pool = graph.pool()
-        #     self.graphs[bs] = graph
-        #     torch.cuda.synchronize()
-        #     reset_context()
+        for bs in reversed(self.graph_bs):
+            graph = torch.cuda.CUDAGraph()
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs] = self.model(input_tensor[:bs], positions[:bs])    # warmup
+            with torch.cuda.graph(graph, self.graph_pool):
+                hidden_state = self.model(input_tensor[:bs], positions[:bs])    # capture
+                outputs[:bs] = hidden_state
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            self.graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
 
         self.graph_vars = dict(
             input_tensor=input_tensor,
