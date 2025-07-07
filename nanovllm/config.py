@@ -26,6 +26,41 @@ class PPNodeType:
 # }
 
 
+_node_id_to_layers_mapping = {
+    0: (0,8, PPNodeType.PPNodeFirst),
+    1: (8,17, PPNodeType.PPNodeMiddle),
+    2: (17,26, PPNodeType.PPNodeMiddle),
+    3: (26,35, PPNodeType.PPNodeMiddle),
+    4: (35,44, PPNodeType.PPNodeMiddle),
+    5: (44,53, PPNodeType.PPNodeMiddle),
+    6: (53,61, PPNodeType.PPNodeLast),
+}
+
+
+# _node_id_to_layers_mapping = {
+#     0: (0,6, PPNodeType.PPNodeFirst),
+#     1: (6,14, PPNodeType.PPNodeMiddle),
+#     2: (14,22, PPNodeType.PPNodeMiddle),
+#     3: (22,30, PPNodeType.PPNodeMiddle),
+#     4: (30,38, PPNodeType.PPNodeMiddle),
+#     5: (38,46, PPNodeType.PPNodeMiddle),
+#     6: (46,54, PPNodeType.PPNodeMiddle),
+#     7: (54,61, PPNodeType.PPNodeLast),
+# }
+
+
+# _node_id_to_layers_mapping = {
+#     0: (0,5, PPNodeType.PPNodeFirst),
+#     1: (5,12, PPNodeType.PPNodeMiddle),
+#     2: (12,19, PPNodeType.PPNodeMiddle),
+#     3: (19,26, PPNodeType.PPNodeMiddle),
+#     4: (26,33, PPNodeType.PPNodeMiddle),
+#     5: (33,40, PPNodeType.PPNodeMiddle),
+#     6: (40,47, PPNodeType.PPNodeMiddle),
+#     7: (47,54, PPNodeType.PPNodeMiddle),
+#     8: (54,61, PPNodeType.PPNodeLast),
+# }
+
 
 # _node_id_to_layers_mapping = {
 #     0: (0,3, PPNodeType.PPNodeFirst),
@@ -62,24 +97,24 @@ class PPNodeType:
 
 
 
-_node_id_to_layers_mapping = {
-    0: (0,3, PPNodeType.PPNodeFirst),
-    1: (3,7, PPNodeType.PPNodeMiddle),
-    2: (7,11, PPNodeType.PPNodeMiddle),
-    3: (11,15, PPNodeType.PPNodeMiddle),
-    4: (15,19, PPNodeType.PPNodeMiddle),
-    5: (19,23, PPNodeType.PPNodeMiddle),
-    6: (23,27, PPNodeType.PPNodeMiddle),
-    7: (27,31, PPNodeType.PPNodeMiddle),
-    8: (31,35, PPNodeType.PPNodeMiddle),
-    9: (35,39, PPNodeType.PPNodeMiddle),
-    10: (39,43, PPNodeType.PPNodeMiddle),
-    11: (43,47, PPNodeType.PPNodeMiddle),
-    12: (47,51, PPNodeType.PPNodeMiddle),
-    13: (51,55, PPNodeType.PPNodeMiddle),
-    14: (55,59, PPNodeType.PPNodeMiddle),
-    15: (59,61, PPNodeType.PPNodeLast),
-}
+# _node_id_to_layers_mapping = {
+#     0: (0,3, PPNodeType.PPNodeFirst),
+#     1: (3,7, PPNodeType.PPNodeMiddle),
+#     2: (7,11, PPNodeType.PPNodeMiddle),
+#     3: (11,15, PPNodeType.PPNodeMiddle),
+#     4: (15,19, PPNodeType.PPNodeMiddle),
+#     5: (19,23, PPNodeType.PPNodeMiddle),
+#     6: (23,27, PPNodeType.PPNodeMiddle),
+#     7: (27,31, PPNodeType.PPNodeMiddle),
+#     8: (31,35, PPNodeType.PPNodeMiddle),
+#     9: (35,39, PPNodeType.PPNodeMiddle),
+#     10: (39,43, PPNodeType.PPNodeMiddle),
+#     11: (43,47, PPNodeType.PPNodeMiddle),
+#     12: (47,51, PPNodeType.PPNodeMiddle),
+#     13: (51,55, PPNodeType.PPNodeMiddle),
+#     14: (55,59, PPNodeType.PPNodeMiddle),
+#     15: (59,61, PPNodeType.PPNodeLast),
+# }
 
 
 
@@ -90,7 +125,7 @@ class Config:
     max_num_batched_tokens: int = 32768
     max_num_seqs: int = 512
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.95
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None

@@ -18,6 +18,8 @@ from nanovllm.utils.serdes import invoke_deserialize_context_kernel, invoke_seri
 
 from safetensors.torch import save_file
 
+from nanovllm.utils.monitor_kvcache_change import KvCacheMonitor
+
 class ModelRunner:
 
     def __init__(self, config: Config, tp_rank: int, mp_queue):
@@ -100,6 +102,8 @@ class ModelRunner:
 
         self.sampler = Sampler()
         self.allocate_kv_cache(config.gpu_memory_utilization)
+
+        self.kvcache_monitor = KvCacheMonitor(self.kv_cache)
 
         print(f"{time.time()}, rank{self.tp_rank},{self.rank}, in ModelRunner __init__ before global barrier", flush=True)
         dist.barrier()

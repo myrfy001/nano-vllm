@@ -13,6 +13,10 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+try:
+    from nanovllm.web_server import model_resp_queue
+except:
+    pass
 
 
 class LLMEngine:
@@ -60,10 +64,16 @@ class LLMEngine:
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+
+        if not is_prefill:
+            model_resp_queue.put(self.tokenizer.decode(token_ids[0]))
         return outputs, num_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
+    
+    def reset_engine(self):
+        self.scheduler.reset()
 
     def generate(
         self,

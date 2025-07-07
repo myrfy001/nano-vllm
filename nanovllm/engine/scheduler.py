@@ -14,6 +14,10 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.config = config
+
+    def reset(self):
+        self.block_manager = BlockManager(self.config.num_kvcache_blocks, self.config.kvcache_block_size)
 
     def is_finished(self):
         return not self.waiting and not self.running
